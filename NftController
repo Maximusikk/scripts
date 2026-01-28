@@ -22,22 +22,24 @@ end
 local SoundService = game:GetService("SoundService")
 
 -- ===== Sounds =====
-local HIT_SOUND_IDS = {
-	"rbxassetid://131364408268129",
-	"rbxassetid://91686059057469",
-	"rbxassetid://79631578921520",
+local SoundConfig = {
+	HIT_SOUND_IDS = {
+		"rbxassetid://131364408268129",
+		"rbxassetid://91686059057469",
+		"rbxassetid://79631578921520",
+	},
+	BREAK_SOUND_ID = "rbxassetid://117575734844739",
+
+	-- троттлинг: чтобы не спамило на каждую тычку от каждого NFT
+	HIT_SOUND_COOLDOWN_PER_COIN = 0.14, -- подстрой: 0.12..0.22 обычно норм
+	HIT_SOUND_COOLDOWN_GLOBAL = 0.04, -- защита от общей каши, даже если 10 монет рядом
+
+	HIT_VOL = 0.55,
+	BREAK_VOL = 0.8,
+
+	ROLLOFF_MIN = 8,
+	ROLLOFF_MAX = 55,
 }
-local BREAK_SOUND_ID = "rbxassetid://117575734844739"
-
--- троттлинг: чтобы не спамило на каждую тычку от каждого NFT
-local HIT_SOUND_COOLDOWN_PER_COIN = 0.14   -- подстрой: 0.12..0.22 обычно норм
-local HIT_SOUND_COOLDOWN_GLOBAL   = 0.04   -- защита от общей каши, даже если 10 монет рядом
-
-local HIT_VOL   = 0.55
-local BREAK_VOL = 0.8
-
-local ROLLOFF_MIN = 8
-local ROLLOFF_MAX = 55
 
 --========================================================
 -- Services & DS
@@ -51,11 +53,13 @@ local Workspace         = game:GetService("Workspace")
 local DataStoreService  = game:GetService("DataStoreService")
 local Debris            = game:GetService("Debris")
 local EquippedStore = DataStoreService:GetDataStore("EquippedNFTs_v1")
-local COMBAT_RING_MIN = 3.6
-local COMBAT_RING_MAX = 5.0
-local HIT_APPROACH_DIST = 1.2   -- насколько ближе к монете делаем удар (внутрь кольца)
-local HIT_UP = 0.7
-local STAND_PAD = 0.06
+local CombatConfig = {
+	RING_MIN = 3.6,
+	RING_MAX = 5.0,
+	HIT_APPROACH_DIST = 1.2, -- насколько ближе к монете делаем удар (внутрь кольца)
+	HIT_UP = 0.7,
+	STAND_PAD = 0.06,
+}
 
 --========================================================
 -- Remotes / Bindables / Resources
@@ -1131,7 +1135,7 @@ local function computePreStandCF(coin: Model, slotIndex: number, n: number, fig:
 	n = math.max(1, n)
 
 	local angle = ((slotIndex - 1) / n) * math.pi * 2
-	local r = COMBAT_RING_MAX
+	local r = CombatConfig.RING_MAX
 
 	local rawPos = coinPos + Vector3.new(math.cos(angle) * r, 0, math.sin(angle) * r)
 
@@ -1143,7 +1147,7 @@ local function computePreStandCF(coin: Model, slotIndex: number, n: number, fig:
 		bottomOffset = fig:GetPivot().Position.Y - getModelBottomY(fig)
 	end
 
-	local pos = Vector3.new(rawPos.X, groundY + bottomOffset + STAND_PAD, rawPos.Z)
+	local pos = Vector3.new(rawPos.X, groundY + bottomOffset + CombatConfig.STAND_PAD, rawPos.Z)
 
 	local cf = CFrame.lookAt(pos, Vector3.new(coinPos.X, pos.Y, coinPos.Z), Vector3.yAxis)
 	return cf
@@ -1737,7 +1741,7 @@ local function startAttackerVisuals(player: Player, coin: Model, state, holder: 
 			fig:SetAttribute("StandJitter", (math.random() * 2 - 1))
 		end
 		if fig:GetAttribute("StandRadius") == nil then
-			local rr = COMBAT_RING_MIN + (COMBAT_RING_MAX - COMBAT_RING_MIN) * (0.55 + math.random() * 0.35)
+			local rr = CombatConfig.RING_MIN + (CombatConfig.RING_MAX - CombatConfig.RING_MIN) * (0.55 + math.random() * 0.35)
 			fig:SetAttribute("StandRadius", rr)
 		end
 
@@ -2296,11 +2300,11 @@ local function computeCombatStandCF(coin: Model, holder: Model?, slotIndex: numb
 	local angle = baseAngle + jitterSeed * math.rad(18)
 
 	-- стабильный радиус (один раз задаём атрибутом)
-	local r = COMBAT_RING_MIN + (COMBAT_RING_MAX - COMBAT_RING_MIN) * 0.65
+	local r = CombatConfig.RING_MIN + (CombatConfig.RING_MAX - CombatConfig.RING_MIN) * 0.65
 	if fig and fig.Parent then
 		local rv = fig:GetAttribute("StandRadius")
 		if typeof(rv) == "number" then
-			r = math.clamp(rv, COMBAT_RING_MIN, COMBAT_RING_MAX)
+			r = math.clamp(rv, CombatConfig.RING_MIN, CombatConfig.RING_MAX)
 		end
 	end
 
@@ -2313,7 +2317,7 @@ local function computeCombatStandCF(coin: Model, holder: Model?, slotIndex: numb
 		bottomOffset = fig:GetPivot().Position.Y - getModelBottomY(fig)
 	end
 
-	local pos = Vector3.new(rawPos.X, groundY + bottomOffset + STAND_PAD, rawPos.Z)
+	local pos = Vector3.new(rawPos.X, groundY + bottomOffset + CombatConfig.STAND_PAD, rawPos.Z)
 
 	local cf = CFrame.lookAt(pos, Vector3.new(coinPos.X, pos.Y, coinPos.Z), Vector3.yAxis)
 	if holder then
@@ -2455,8 +2459,8 @@ local function _play3DSoundAt(pos: Vector3, soundId: string, volume: number, lif
 	s.SoundId = soundId
 	s.Volume = volume or 0.6
 	s.PlaybackSpeed = 1.0 + ((math.random() - 0.5) * pitchJitter)
-	s.RollOffMinDistance = ROLLOFF_MIN
-	s.RollOffMaxDistance = ROLLOFF_MAX
+	s.RollOffMinDistance = SoundConfig.ROLLOFF_MIN
+	s.RollOffMaxDistance = SoundConfig.ROLLOFF_MAX
 	s.Parent = a
 
 	s:Play()
@@ -2469,7 +2473,7 @@ local function playCoinHitSfxThrottled(coin: Model, pos: Vector3)
 	local now = tick()
 
 	-- глобальный предохранитель
-	if (now - _lastGlobalHitSfxAt) < HIT_SOUND_COOLDOWN_GLOBAL then
+	if (now - _lastGlobalHitSfxAt) < SoundConfig.HIT_SOUND_COOLDOWN_GLOBAL then
 		return
 	end
 
@@ -2480,15 +2484,15 @@ local function playCoinHitSfxThrottled(coin: Model, pos: Vector3)
 	end
 
 	-- троттлинг на монету
-	if (now - (st.lastHitAt or 0)) < HIT_SOUND_COOLDOWN_PER_COIN then
+	if (now - (st.lastHitAt or 0)) < SoundConfig.HIT_SOUND_COOLDOWN_PER_COIN then
 		return
 	end
 
 	st.lastHitAt = now
 	_lastGlobalHitSfxAt = now
 
-	local id = HIT_SOUND_IDS[math.random(1, #HIT_SOUND_IDS)]
-	_play3DSoundAt(pos, id, HIT_VOL, 1.2, 0.14)
+	local id = SoundConfig.HIT_SOUND_IDS[math.random(1, #SoundConfig.HIT_SOUND_IDS)]
+	_play3DSoundAt(pos, id, SoundConfig.HIT_VOL, 1.2, 0.14)
 end
 
 local function playCoinBreakSfxOnce(coin: Model, pos: Vector3)
@@ -2502,7 +2506,7 @@ local function playCoinBreakSfxOnce(coin: Model, pos: Vector3)
 	if st.breakPlayed then return end
 	st.breakPlayed = true
 
-	_play3DSoundAt(pos, BREAK_SOUND_ID, BREAK_VOL, 2.2, 0.06)
+	_play3DSoundAt(pos, SoundConfig.BREAK_SOUND_ID, SoundConfig.BREAK_VOL, 2.2, 0.06)
 end
 
 coinImpulse = function(coin: Model, dirFlat: Vector3, strength: number?)
