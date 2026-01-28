@@ -1,0 +1,4338 @@
+-- # nftcontroller
+local HOLDER_FACE_OFFSET = CFrame.new()
+local CARD_YAW_DEG   = 270
+local CARD_PITCH_DEG = 0
+local CARD_ROLL_DEG  = -360
+local hasActiveBoost -- forward declare (чтобы было видно в loop)
+--========================================================
+-- Background → coin multiplier
+--========================================================
+local Backgrounds = {
+	AmberGlow= {multiple=1}, LightGray= {multiple=1}, BeigePastel= {multiple=1},
+	BlueMist=  {multiple=1}, GrassCalm= {multiple=1}, PinkSoft=   {multiple=1.5},
+	TauWarm=   {multiple=1.5},  CobaltHaze={multiple=1.5},  OliveRich=  {multiple=1.5},
+	PeachSunset={multiple=1.5}, CrimsonShockWave={multiple=2}, EmeraldCrystal={multiple=2},
+	GoldBullion={multiple=3}, RubyGemstone={multiple=3}, RoyalCrown={multiple=5},
+}
+local function getBgMultiplier(bgName:string?)
+	if not bgName or bgName == "" then return 1.0 end
+	local row = Backgrounds[tostring(bgName)]
+	return (row and tonumber(row.multiple)) or 1.0
+end
+local SoundService = game:GetService("SoundService")
+
+-- ===== Sounds =====
+local HIT_SOUND_IDS = {
+	"rbxassetid://131364408268129",
+	"rbxassetid://91686059057469",
+	"rbxassetid://79631578921520",
+}
+local BREAK_SOUND_ID = "rbxassetid://117575734844739"
+
+-- троттлинг: чтобы не спамило на каждую тычку от каждого NFT
+local HIT_SOUND_COOLDOWN_PER_COIN = 0.14   -- подстрой: 0.12..0.22 обычно норм
+local HIT_SOUND_COOLDOWN_GLOBAL   = 0.04   -- защита от общей каши, даже если 10 монет рядом
+
+local HIT_VOL   = 0.55
+local BREAK_VOL = 0.8
+
+local ROLLOFF_MIN = 8
+local ROLLOFF_MAX = 55
+
+--========================================================
+-- Services & DS
+--========================================================
+local ReplicatedStorage = game:GetService("ReplicatedStorage")
+local Players           = game:GetService("Players")
+local RunService        = game:GetService("RunService")
+local ServerStorage     = game:GetService("ServerStorage")
+local TweenService      = game:GetService("TweenService")
+local Workspace         = game:GetService("Workspace")
+local DataStoreService  = game:GetService("DataStoreService")
+local Debris            = game:GetService("Debris")
+local EquippedStore = DataStoreService:GetDataStore("EquippedNFTs_v1")
+local COMBAT_RING_MIN = 3.6
+local COMBAT_RING_MAX = 5.0
+local HIT_APPROACH_DIST = 1.2   -- насколько ближе к монете делаем удар (внутрь кольца)
+local HIT_UP = 0.7
+local STAND_PAD = 0.06
+
+--========================================================
+-- Remotes / Bindables / Resources
+--========================================================
+local ForceUnequipNFT = ServerStorage:FindFirstChild("ForceUnequipNFT")
+if not ForceUnequipNFT then
+	ForceUnequipNFT = Instance.new("BindableEvent")
+	ForceUnequipNFT.Name = "ForceUnequipNFT"
+	ForceUnequipNFT.Parent = ServerStorage
+end
+
+local EquipNftServer = ServerStorage:FindFirstChild("EquipNftServer")
+if not EquipNftServer then
+	EquipNftServer = Instance.new("BindableEvent")
+	EquipNftServer.Name = "EquipNftServer"
+	EquipNftServer.Parent = ServerStorage
+end
+local NftFiguresModels = ReplicatedStorage:WaitForChild("NftFiguresModels")
+local FigureHolderTemplate = ReplicatedStorage:WaitForChild("NftFigureHolder")
+
+local FigureOverrides = {
+	VoxelSamurai        = { offset = CFrame.new(0, 0.6, 0), scale = 1.0 },
+	VoxelDivineOverlord = { offset = CFrame.new(0, 0.9, 0), scale = 1.0 },
+
+	-- ✅ сломанная модель: повернуть на 90°
+	PixelMagicRaven     = { offset = CFrame.Angles(0, math.rad(-90), 0), scale = 1.0 },
+}
+
+--========================================================
+-- Special height offsets (лимитки выше других)
+--========================================================
+local DEFAULT_CARD_HEIGHT = 3.7
+
+local SPECIAL_CARD_HEIGHTS = {
+	samurai  = 10,
+	overlord = 10,
+}
+
+local function clampHolderToGroundByBottom(cf: CFrame, holderModel: Model, pad: number?, extraExclude: {Instance}?): CFrame
+	pad = pad or 0.06
+	if not (holderModel and holderModel.Parent) then return cf end
+
+	-- пол под целевой позицией (маленький rayUp, чтоб не ловить потолки)
+	local gy = getGroundYNear(cf.Position, 2.5, 260, extraExclude)
+
+	-- текущий bottomOffset модели: pivotY - bottomY
+	local pivotY = holderModel:GetPivot().Position.Y
+	local bottomY = getModelBottomY(holderModel)
+	local bottomOffset = pivotY - bottomY
+
+	-- ✅ НОВОЕ: оффсет относительно ЗЕМЛИ (может быть отрицательный)
+	local groundOff = holderModel:GetAttribute("GroundOffsetY")
+	if typeof(groundOff) ~= "number" then
+		groundOff = 0
+	end
+
+	local targetY = gy + bottomOffset + pad + groundOff
+
+	local pos = cf.Position
+	if pos.Y < targetY then
+		pos = Vector3.new(pos.X, targetY, pos.Z)
+	end
+
+	return CFrame.new(pos) * (cf - cf.Position)
+end
+
+
+local function normalizeNftKey(s: string?): string
+	s = tostring(s or "")
+	s = string.lower(s)
+	s = s:gsub("^%s+", ""):gsub("%s+$", "") -- trim
+	s = s:gsub("[%s_%-]", "")               -- убрали пробелы/_/-
+	return s
+end
+local function getFigureOverride(nftName: string)
+	local key = normalizeNftKey(nftName)
+	if key:find("samurai", 1, true) then
+		return { offset = CFrame.new(0, 1.2, 0), scale = 1.0 }
+	end
+	if key:find("overlord", 1, true) then
+		return { offset = CFrame.new(0, 1.8, 0), scale = 1.0 }
+	end
+	return nil
+end
+local function _clamp01(x) return math.clamp(x, 0, 1) end
+
+local function _lerp(a, b, t)
+	return a + (b - a) * t
+end
+
+local function _signedNoise(amount)
+	return (math.random() * 2 - 1) * (amount or 1)
+end
+
+-- ✅ Стабильный “характер” для каждой attack-figure (один раз)
+local function ensureAttackStyle(fig: Instance)
+	if not (fig and fig.Parent) then return end
+
+	-- один общий seed (0..1)
+	if fig:GetAttribute("AtkStyleSeed") == nil then
+		fig:SetAttribute("AtkStyleSeed", math.random())
+	end
+
+	-- отдельные seed'ы под параметры (0..1)
+	if fig:GetAttribute("AtkTempoSeed") == nil then
+		fig:SetAttribute("AtkTempoSeed", math.random())
+	end
+	if fig:GetAttribute("AtkRangeSeed") == nil then
+		fig:SetAttribute("AtkRangeSeed", math.random())
+	end
+	if fig:GetAttribute("AtkUpSeed") == nil then
+		fig:SetAttribute("AtkUpSeed", math.random())
+	end
+	if fig:GetAttribute("AtkSideSeed") == nil then
+		fig:SetAttribute("AtkSideSeed", math.random())
+	end
+
+	-- любимая сторона: -1 или +1 (стабильная)
+	if fig:GetAttribute("AtkSideSign") == nil then
+		fig:SetAttribute("AtkSideSign", (math.random() < 0.5) and -1 or 1)
+	end
+end
+
+-- удобно читать (с фоллбеком)
+local function getAtkSeed(fig: Instance, name: string, default: number)
+	local v = fig:GetAttribute(name)
+	if typeof(v) ~= "number" then return default end
+	return v
+end
+
+local function getCardYOffsetByNftName(nftName: string?): number
+	local key = normalizeNftKey(nftName)
+
+	-- 1) точное совпадение
+	local h = SPECIAL_CARD_HEIGHTS[key]
+	if not h then
+		-- 2) contains совпадение по корням
+		for k, hh in pairs(SPECIAL_CARD_HEIGHTS) do
+			if key:find(k, 1, true) then
+				h = hh
+				break
+			end
+		end
+	end
+
+	if not h then return 0 end
+	return math.max(0, (h - DEFAULT_CARD_HEIGHT) * 0.5)
+end
+
+
+local function getHolderCardYOffset(holder: Model): number
+	if not holder then return 0 end
+
+	-- ✅ сначала пробуем уже нормализованный ключ
+	local k = holder:GetAttribute("NftKey")
+	if k ~= nil then
+		local h = SPECIAL_CARD_HEIGHTS[tostring(k)]
+		if h then
+			return math.max(0, (h - DEFAULT_CARD_HEIGHT) * 0.5)
+		end
+	end
+
+	-- fallback: по имени
+	return getCardYOffsetByNftName(holder:GetAttribute("Nft"))
+end
+
+
+local GetPlayerEquipmentBF = ServerStorage:FindFirstChild("GetPlayerEquipment")
+local SelectCoinEvent     = ReplicatedStorage:WaitForChild("SelectCoin")
+local ClearCircleEvent    = ReplicatedStorage:WaitForChild("ClearCoinCircle")
+local EquipNftEvent       = ReplicatedStorage:WaitForChild("EquipNft")
+local UnequipNftEvent     = ReplicatedStorage:WaitForChild("UnequipNft")
+local UnequipAllEvent     = ReplicatedStorage:FindFirstChild("UnequipAllNft")
+
+--=== Equipped NFT stats (power + coin multiplier) ===
+local GetEquippedNftStatsRF = ReplicatedStorage:FindFirstChild("GetEquippedNftStats")
+if not GetEquippedNftStatsRF then
+	GetEquippedNftStatsRF = Instance.new("RemoteFunction")
+	GetEquippedNftStatsRF.Name = "GetEquippedNftStats"
+	GetEquippedNftStatsRF.Parent = ReplicatedStorage
+end
+
+local GetEquippedUuidsRF = ReplicatedStorage:FindFirstChild("GetEquippedUuids")
+if not GetEquippedUuidsRF then
+	GetEquippedUuidsRF = Instance.new("RemoteFunction")
+	GetEquippedUuidsRF.Name = "GetEquippedUuids"
+	GetEquippedUuidsRF.Parent = ReplicatedStorage
+end
+local ApplyEquippedLayoutRF = ReplicatedStorage:FindFirstChild("ApplyEquippedLayout")
+if not ApplyEquippedLayoutRF then
+	ApplyEquippedLayoutRF = Instance.new("RemoteFunction")
+	ApplyEquippedLayoutRF.Name = "ApplyEquippedLayout"
+	ApplyEquippedLayoutRF.Parent = ReplicatedStorage
+end
+
+local SetEquipSaveSuppressed = ReplicatedStorage:FindFirstChild("SetEquipSaveSuppressed")
+if not SetEquipSaveSuppressed then
+	SetEquipSaveSuppressed = Instance.new("RemoteEvent")
+	SetEquipSaveSuppressed.Name = "SetEquipSaveSuppressed"
+	SetEquipSaveSuppressed.Parent = ReplicatedStorage
+end
+
+local CrustsTemplates     = ReplicatedStorage:WaitForChild("CrustsTemplates")
+local GetRbxAssetId       = require(game.ServerScriptService:WaitForChild("Rbxassetid"))
+
+-- Payouts & boosts
+local PayEvent            = ServerStorage:FindFirstChild("Pay") -- NOTE: НЕ используем напрямую для монет; платит OrbService
+local AddPlayerBoostEvent = ServerStorage:WaitForChild("AddPlayerBoost")
+
+-- HackFX (встраиваем визуалки взлома)
+local HackFX = require(game.ServerScriptService:WaitForChild("HackFX"))
+
+-- [PS99 STREAM] внешние модули
+local OrbService       = require(game.ServerStorage:WaitForChild("OrbService"))
+local StreamedRewards  = require(game.ServerScriptService:WaitForChild("StreamedRewards"))
+-- Простые подсказки, что мы брутфорсим сид/пароль
+local SEED_HINTS = {
+	"seed",
+	"wallet",
+	"password",
+	"pass guess",
+	"seed guess",
+	"try phrase",
+	"word list",
+	"key guess",
+	"phrase try",
+	"seed try",
+}
+
+local function randomSeedHint()
+	-- иногда добавляем циферку для вида
+	if math.random() < 0.5 then
+		return SEED_HINTS[math.random(1, #SEED_HINTS)]
+	else
+		return "seed " .. tostring(math.random(0, 9999))
+	end
+end
+
+--========================================================
+-- Formation / visuals
+--========================================================
+local spacingX, spacingZ = 9, 7
+local baseHeight = 0
+local formationOffsets = {
+	Vector3.new(-spacingX,     baseHeight, spacingZ * 1),
+	Vector3.new(0,             baseHeight, spacingZ * 1),
+	Vector3.new(spacingX,      baseHeight, spacingZ * 1),
+
+	Vector3.new(-spacingX*1.2, baseHeight, spacingZ * 2),
+	Vector3.new(0,             baseHeight, spacingZ * 2),
+	Vector3.new(spacingX*1.2,  baseHeight, spacingZ * 2),
+
+	Vector3.new(-spacingX*1.4, baseHeight, spacingZ * 3),
+	Vector3.new(0,             baseHeight, spacingZ * 3),
+	Vector3.new(spacingX*1.4,  baseHeight, spacingZ * 3),
+
+	Vector3.new(0,             baseHeight, spacingZ * 4),
+}
+local lerpSpeed      = 0.05
+local HOVERBOARD_YAW_OFFSET_DEG = 90
+
+-- если NFT дальше этого расстояния от своей целевой точки,
+-- то мы просто телепортируем его в цель без плавного долёта
+local SNAP_DISTANCE_FOLLOW = 60
+
+local function getFlatCFrame(cf)
+	local pos = cf.Position
+	local forward = cf.LookVector
+	local flat = Vector3.new(forward.X, 0, forward.Z)
+	if flat.Magnitude < 1e-3 then flat = Vector3.new(0, 0, 1) else flat = flat.Unit end
+	return CFrame.lookAt(pos, pos + flat, Vector3.new(0, 1, 0))
+end
+local function getBoardYawCF(cf) return getFlatCFrame(cf * CFrame.Angles(0, math.rad(-HOVERBOARD_YAW_OFFSET_DEG), 0)) end
+local function isRidingHoverboard(player)
+	local hrp  = player.Character and player.Character:FindFirstChild("HumanoidRootPart")
+	return hrp and hrp:FindFirstChild("HB_RiderRig") ~= nil
+end
+local function getFormationBaseCF(player)
+	local hrp  = player.Character and player.Character:FindFirstChild("HumanoidRootPart")
+	if not hrp then return nil end
+	if isRidingHoverboard(player) then return getBoardYawCF(hrp.CFrame) else return getFlatCFrame(hrp.CFrame) end
+end
+--========================================================
+-- Boost presets (UI цвет — инфо)
+--========================================================
+local BOOST_LIST = { "2xCoinBoost", "2xLuckBoost", "2xPowerBoost", "2xGemsBoost" }
+local BOOST_COLORS = {
+	["2xCoinBoost"]  = Color3.new(1, 1, 0),
+	["2xLuckBoost"]  = Color3.new(0, 1, 0),
+	["2xPowerBoost"] = Color3.new(1, 0, 0),
+	["2xGemsBoost"]  = Color3.new(0.4, 0.6, 1)
+}
+
+--========================================================
+-- State
+--========================================================
+local EquippedNFTs  = {}   -- [player] = { model1, ... }
+local NFTBusy       = {}   -- [nftModel] = true
+local ActiveAttacks = {}   -- [coinModel] = {attackers={}, owner, connection, accum, keyboards, typingConns, damageByNft, fxToken}
+local NFTTarget     = setmetatable({}, {__mode="k"}) -- [nftModel] = coinModel
+local FIGURE_FACE_YAW_DEG = -90 
+-- [PERSIST] отложенное сохранение + подавление и грязный флаг
+local _saveDebounce   = {}           -- [player]=task
+local _saveDueAt      = {}           -- [player]=time (min-interval)
+local _suppressSave   = {}           -- [player]=bool
+local _pendingDirty   = {}           -- [player]=bool
+local MIN_SAVE_INTERVAL = 2.0        -- сек — предохранитель от очереди DS
+local ensurePrimary
+local tweenPivot
+local tweenModelPivot
+local computeHolderTargetCF
+local tweenHolderToCoinSpot
+-- [ATOMIC INTENT]
+local _lastDesiredEquipped = {} -- [player] = {uuid,...}
+
+-- [PENDING]
+local PendingEquip = {}   -- [player] = {uuid,...}
+local UpgradeConns = {}   -- [player] = RBXScriptConnection
+
+--========================================================
+-- Helpers working on EquippedNFTs
+--========================================================
+
+local function findFigure(holder: Model): Model?
+	return holder:FindFirstChild("Figure")
+end
+
+local function _iterSelfAndDescendants(inst: Instance)
+	local t = { inst }
+	for _, d in ipairs(inst:GetDescendants()) do
+		t[#t+1] = d
+	end
+	return t
+end
+
+local function setModelAnchored(model: Model, anchored: boolean)
+	for _, d in ipairs(model:GetDescendants()) do
+		if d:IsA("BasePart") then
+			d.Anchored = anchored
+			d.CanCollide = false
+			d.CanQuery = false
+			d.CanTouch = false
+		end
+	end
+end
+local GROUND_PAD = 0.35
+local CRIT_SLAM_CHANCE   = 0.25
+local CRIT_SLAM_MULT     = 2.0
+local CRIT_SLAM_COIN_CD  = 1.4  -- сек, чтобы 10 фигурок не критовали каждую секунду
+local function clampPosToGround(pos: Vector3, pad: number?, extraExclude: {Instance}?): Vector3
+	pad = pad or GROUND_PAD
+	local gy = getGroundYNear(pos, 35, 400, extraExclude)
+	if pos.Y < gy + pad then
+		return Vector3.new(pos.X, gy + pad, pos.Z)
+	end
+	return pos
+end
+local function clampPosToGroundForAttack(pos: Vector3, pad: number?, extraExclude: {Instance}?): Vector3
+	pad = pad or GROUND_PAD
+
+	-- ✅ ключ: маленький rayUp, чтобы не ловить потолки/крышу сверху
+	local gy = getGroundYNear(pos, 2.5, 500, extraExclude)
+
+	if pos.Y < gy + pad then
+		return Vector3.new(pos.X, gy + pad, pos.Z)
+	end
+	return pos
+end
+
+
+local function clampCFrameToGround(cf: CFrame, pad: number?, extraExclude: {Instance}?): CFrame
+	local pos = clampPosToGround(cf.Position, pad, extraExclude)
+	return CFrame.new(pos) * (cf - cf.Position)
+end
+
+
+local function arcJumpSpin(model: Model, fromCF: CFrame, toCF: CFrame, spinTurns: number?, height: number?, totalT: number?)
+	if not (model and model.Parent) then return end
+	spinTurns = spinTurns or 1
+
+	local p0 = fromCF.Position
+	local p1 = toCF.Position
+	local flatDist = (Vector3.new(p1.X,0,p1.Z) - Vector3.new(p0.X,0,p0.Z)).Magnitude
+
+	if not totalT then
+		totalT = math.clamp(flatDist / 18, 0.24, 0.50)
+	end
+	if not height then
+		height = math.clamp(flatDist * 0.70, 2.8, 7.0)
+	end
+
+	local bottomOffset = model:GetPivot().Position.Y - getModelBottomY(model)
+	local minY = toCF.Position.Y - bottomOffset + 0.02
+
+	local mid = (p0 + p1) * 0.5 + Vector3.new(0, height, 0)
+
+	local function bezier(a, b, c, t)
+		local ab = a:Lerp(b, t)
+		local bc = b:Lerp(c, t)
+		return ab:Lerp(bc, t)
+	end
+
+	local alpha = Instance.new("NumberValue")
+	alpha.Value = 0
+
+	local conn
+	conn = RunService.Heartbeat:Connect(function()
+		if not (model and model.Parent) then
+			if conn then conn:Disconnect() end
+			alpha:Destroy()
+			return
+		end
+
+		local t = alpha.Value
+		local pos = bezier(p0, mid, p1, t)
+		pos = Vector3.new(pos.X, math.max(pos.Y, minY), pos.Z)
+
+		-- база ориентации: берём из toCF, как у тебя в arcJump
+		local _,_,_, r00,r01,r02, r10,r11,r12, r20,r21,r22 = toCF:GetComponents()
+		local base = CFrame.new(pos.X,pos.Y,pos.Z, r00,r01,r02, r10,r11,r12, r20,r21,r22)
+
+		-- плавный roll по времени
+		local roll = (t * math.pi * 2) * spinTurns
+		model:PivotTo(base * CFrame.Angles(0, 0, roll))
+	end)
+
+	local tw = TweenService:Create(alpha, TweenInfo.new(totalT, Enum.EasingStyle.Quad, Enum.EasingDirection.Out), {Value = 1})
+	tw:Play()
+	tw.Completed:Wait()
+
+	if conn then conn:Disconnect() end
+	alpha:Destroy()
+
+	if model and model.Parent then
+		model:PivotTo(toCF)
+	end
+end
+local CollectionService = game:GetService("CollectionService")
+
+-- === СТЕНЫ ЛОКАЦИЙ, КОТОРЫЕ НУЖНО ИГНОРИРОВАТЬ ДЛЯ NFT (ВСЕГДА) ===
+
+local WALL_WORLDS = {
+	"PixelWorld1",
+	"PixelMagicCastle2",
+	"SumeruForest3",
+	"BeachWorld4",
+}
+
+-- Если у стен есть общий префикс/суффикс — можешь сузить фильтр.
+local function looksLikeWallName(name: string): boolean
+	name = string.lower(tostring(name or ""))
+
+	-- более “жёсткие” совпадения
+	if name:find("wall") then return true end
+	if name:find("стен") then return true end
+	if name:find("barrier") then return true end
+	if name:find("gate") then return true end
+	if name:find("door") then return true end
+	if name:find("fence") then return true end
+	if name:find("border") then return true end
+	if name:find("bounds") then return true end
+	if name:find("blocker") then return true end
+	if name:find("invis") and name:find("wall") then return true end
+	if name:find("collision") then return true end
+	if name:find("collider") then return true end
+
+	return false
+end
+
+
+-- (опционально) если ты реально ставил Tag на стены
+local WALL_TAG  = "Wall"
+-- (опционально) если ты реально ставил Attribute на стены
+local WALL_ATTR = "IsWall"
+
+local function _addUnique(out, seen, inst: Instance?)
+	if not inst then return end
+	if seen[inst] then return end
+	seen[inst] = true
+	out[#out+1] = inst
+end
+
+-- КЭШ
+local _WALLS_CACHE: {Instance}? = nil
+local _WALLS_CACHE_T = 0
+local WALLS_CACHE_TTL = 1.0
+
+-- Ускоряем: набор для O(1) проверки
+local _WALL_SET: {[Instance]: boolean}? = nil
+
+local function collectWallsToIgnore(): ({Instance}, {[Instance]: boolean})
+	local out = {}
+	local seen = {}
+
+	-- 1) по мирам (ищем ИМЕННО части, потому что raycast попадает в BasePart)
+	for _, worldName in ipairs(WALL_WORLDS) do
+		local world = Workspace:FindFirstChild(worldName)
+		if world then
+			for _, inst in ipairs(world:GetDescendants()) do
+				if inst:IsA("BasePart") then
+					-- Attribute / Tag на самой части или на родителе-модели
+					if (WALL_ATTR and inst:GetAttribute(WALL_ATTR) == true)
+						or (WALL_TAG and WALL_TAG ~= "" and CollectionService:HasTag(inst, WALL_TAG))
+						or looksLikeWallName(inst.Name)
+					then
+						_addUnique(out, seen, inst)
+					else
+						local par = inst.Parent
+						if par then
+							if (WALL_ATTR and par:GetAttribute(WALL_ATTR) == true)
+								or (WALL_TAG and WALL_TAG ~= "" and CollectionService:HasTag(par, WALL_TAG))
+								or looksLikeWallName(par.Name)
+							then
+								_addUnique(out, seen, inst)
+							end
+						end
+					end
+				end
+			end
+		end
+	end
+
+	-- 2) Tag: если тэг стоит на Model, добавим ВСЕ BasePart внутри
+	if WALL_TAG and WALL_TAG ~= "" then
+		for _, tagged in ipairs(CollectionService:GetTagged(WALL_TAG)) do
+			if tagged:IsA("BasePart") then
+				_addUnique(out, seen, tagged)
+			else
+				for _, d in ipairs(tagged:GetDescendants()) do
+					if d:IsA("BasePart") then
+						_addUnique(out, seen, d)
+					end
+				end
+			end
+		end
+	end
+
+	return out, seen
+end
+
+local function getWallsExcludeList(): {Instance}
+	local t = os.clock()
+	if (not _WALLS_CACHE) or (t - _WALLS_CACHE_T > WALLS_CACHE_TTL) then
+		local list, set = collectWallsToIgnore()
+		_WALLS_CACHE = list
+		_WALL_SET = set
+		_WALLS_CACHE_T = t
+	end
+	return _WALLS_CACHE
+end
+
+-- Быстрая проверка “это стена?”
+local function isWallInstance(inst: Instance?): boolean
+	if not inst then return false end
+
+	-- быстрый hit по set (для BasePart стен)
+	if _WALL_SET and _WALL_SET[inst] then
+		return true
+	end
+
+	-- tag/attr на самой детали
+	if WALL_ATTR and inst:GetAttribute(WALL_ATTR) == true then
+		return true
+	end
+	if WALL_TAG and WALL_TAG ~= "" and CollectionService:HasTag(inst, WALL_TAG) then
+		return true
+	end
+	if looksLikeWallName(inst.Name) then
+		return true
+	end
+
+	-- tag/attr/имя на предках (часто стена — Model, а hit — Part внутри)
+	local p = inst.Parent
+	for _=1, 8 do
+		if not p then break end
+		if WALL_ATTR and p:GetAttribute(WALL_ATTR) == true then return true end
+		if WALL_TAG and WALL_TAG ~= "" and CollectionService:HasTag(p, WALL_TAG) then return true end
+		if looksLikeWallName(p.Name) then return true end
+		p = p.Parent
+	end
+
+	return false
+end
+
+local function arcJump(model: Model, fromCF: CFrame, toCF: CFrame, height: number?, tUp: number?, tDown: number?)
+	if not (model and model.Parent) then return end
+
+	-- высота/время теперь авто (параметры можно передавать, но они уже не обязательны)
+	local p0 = fromCF.Position
+	local p1 = toCF.Position
+	local flatDist = (Vector3.new(p1.X, 0, p1.Z) - Vector3.new(p0.X, 0, p0.Z)).Magnitude
+
+	local totalT = (tUp and tDown) and (tUp + tDown) or nil
+	if not totalT then
+		-- чем дальше — тем дольше, но в разумных рамках
+		totalT = math.clamp(flatDist / 16, 0.26, 0.55)
+	end
+
+	if not height then
+		-- чем дальше — тем выше, чтобы был “экшен”
+		height = math.clamp(flatDist * 0.65, 2.4, 6.2)
+	end
+
+	-- защита от проваливания в землю
+	local bottomOffset = model:GetPivot().Position.Y - getModelBottomY(model)
+	local minY = toCF.Position.Y - bottomOffset + 0.02
+
+	-- квадратичная Безье (p0 -> mid -> p1)
+	local mid = (p0 + p1) * 0.5 + Vector3.new(0, height, 0)
+
+	local function bezier(a, b, c, t)
+		local ab = a:Lerp(b, t)
+		local bc = b:Lerp(c, t)
+		return ab:Lerp(bc, t)
+	end
+
+	local function lookCF(pos: Vector3): CFrame
+		-- сохраняем ориентацию toCF, чтобы фигура “смотрела” стабильно
+		local _,_,_, r00,r01,r02, r10,r11,r12, r20,r21,r22 = toCF:GetComponents()
+		return CFrame.new(
+			pos.X,
+			math.max(pos.Y, minY),
+			pos.Z,
+			r00,r01,r02,
+			r10,r11,r12,
+			r20,r21,r22
+		)
+	end
+
+	-- один твийн: двигаем параметр [0..1], а позицию считаем сами (без стыков)
+	local alpha = Instance.new("NumberValue")
+	alpha.Value = 0
+
+	local conn
+	conn = RunService.Heartbeat:Connect(function()
+		if not (model and model.Parent) then
+			if conn then conn:Disconnect() end
+			alpha:Destroy()
+			return
+		end
+		local t = alpha.Value
+		-- лёгкий “вынос” вверх по синусу (ещё плавнее)
+		local pos = bezier(p0, mid, p1, t)
+		model:PivotTo(lookCF(pos))
+	end)
+
+	local tw = TweenService:Create(
+		alpha,
+		TweenInfo.new(totalT, Enum.EasingStyle.Quad, Enum.EasingDirection.Out),
+		{ Value = 1 }
+	)
+	tw:Play()
+	tw.Completed:Wait()
+
+	if conn then conn:Disconnect() end
+	alpha:Destroy()
+
+	-- финально точно ставим в цель
+	if model and model.Parent then
+		model:PivotTo(lookCF(p1))
+	end
+end
+
+getModelBottomY = function(model: Model): number
+	local minY = math.huge
+	for _, d in ipairs(model:GetDescendants()) do
+		if d:IsA("BasePart") then
+			local y = d.Position.Y - d.Size.Y * 0.5
+			if y < minY then
+				minY = y
+			end
+		end
+	end
+	if minY == math.huge then
+		return model:GetPivot().Position.Y
+	end
+	return minY
+end
+local function _spawnShockwave(pos: Vector3)
+	local p = Instance.new("Part")
+	p.Anchored = true
+	p.CanCollide = false
+	p.CanQuery = false
+	p.CanTouch = false
+	p.Transparency = 0.55
+	p.Material = Enum.Material.Neon
+	p.Size = Vector3.new(0.2, 0.12, 0.2)
+	p.CFrame = CFrame.new(pos) * CFrame.Angles(math.rad(90), 0, 0)
+	p.Parent = workspace
+
+	local mesh = Instance.new("SpecialMesh")
+	mesh.MeshType = Enum.MeshType.Cylinder
+	mesh.Scale = Vector3.new(1, 1, 1)
+	mesh.Parent = p
+
+	-- ✅ меньше “всего экрана”
+	local tw1 = TweenService:Create(p, TweenInfo.new(0.10, Enum.EasingStyle.Quad, Enum.EasingDirection.Out), {
+		Size = Vector3.new(4.8, 0.12, 4.8),
+		Transparency = 0.80,
+	})
+	local tw2 = TweenService:Create(p, TweenInfo.new(0.12, Enum.EasingStyle.Quad, Enum.EasingDirection.In), {
+		Size = Vector3.new(6.4, 0.12, 6.4),
+		Transparency = 1,
+	})
+
+	tw1:Play()
+	tw1.Completed:Connect(function() tw2:Play() end)
+	Debris:AddItem(p, 0.28)
+end
+
+ensurePrimary = function(model: Model): BasePart?
+	if not model then return nil end
+	if model.PrimaryPart and model.PrimaryPart:IsA("BasePart") then
+		return model.PrimaryPart
+	end
+	local p = model:FindFirstChildWhichIsA("BasePart", true)
+	if p then
+		model.PrimaryPart = p
+		return p
+	end
+	return nil
+end
+
+local function _spawnAfterImage(model: Model, life: number?)
+	life = life or 0.18
+	if not (model and model.Parent) then return end
+
+	local ghost = model:Clone()
+	ghost.Name = "_AfterImage"
+	ghost.Parent = workspace
+	setModelAnchored(ghost, true)
+
+	-- делаем “призрака”: повышаем прозрачность/убираем лишнее
+	for _, d in ipairs(ghost:GetDescendants()) do
+		if d:IsA("BasePart") then
+			d.CanCollide = false
+			d.CanQuery = false
+			d.CanTouch = false
+			d.Material = Enum.Material.Neon
+			d.Transparency = math.clamp((d.Transparency or 0) + 0.55, 0, 1)
+		elseif d:IsA("Decal") then
+			d.Transparency = math.clamp((d.Transparency or 0) + 0.55, 0, 1)
+		elseif d:IsA("ParticleEmitter") or d:IsA("Trail") then
+			d.Enabled = false
+		end
+	end
+
+	-- плавно растворяем
+	task.spawn(function()
+		local t0 = tick()
+		while ghost and ghost.Parent and (tick() - t0) < life do
+			local a = (tick() - t0) / life
+			for _, d in ipairs(ghost:GetDescendants()) do
+				if d:IsA("BasePart") then
+					d.Transparency = math.clamp(d.Transparency + 0.03, 0, 1)
+				end
+			end
+			task.wait(0.02)
+		end
+		if ghost and ghost.Parent then ghost:Destroy() end
+	end)
+end
+local function _hitStopModel(model: Model, hold: number?)
+	hold = hold or 0.06
+	if not (model and model.Parent) then return end
+	setModelAnchored(model, true)
+	task.wait(hold)
+	if model and model.Parent then
+		setModelAnchored(model, true) -- оставляем anchored, у тебя весь бой anchored и так
+	end
+end
+
+local function _hitStopPart(part: BasePart, hold: number?)
+	hold = hold or 0.05
+	if not (part and part.Parent) then return end
+	local wasAnchored = part.Anchored
+	part.Anchored = true
+	task.wait(hold)
+	if part and part.Parent then
+		part.Anchored = wasAnchored
+	end
+end
+local function _afterImageBurst(model: Model)
+	task.spawn(function()
+		_spawnAfterImage(model, 0.14)
+		task.wait(0.035)
+		_spawnAfterImage(model, 0.14)
+		task.wait(0.035)
+		_spawnAfterImage(model, 0.14)
+	end)
+end
+
+clampModelToGroundByBBox = function(inst: Instance, pad: number?, extraExclude: {Instance}?)
+	pad = pad or 0.18
+
+	local cf, size
+	if inst:IsA("Model") then
+		cf, size = inst:GetBoundingBox()
+	elseif inst:IsA("BasePart") then
+		cf, size = inst.CFrame, inst.Size
+	else
+		return
+	end
+
+	local bottomY = cf.Position.Y - (size.Y * 0.5)
+
+	-- ✅ теперь пробивной ground (игнорит CanCollide=false)
+	local groundY = getGroundYNear(cf.Position, 35, 400, extraExclude)
+
+	local targetBottom = groundY + pad
+	if bottomY < targetBottom then
+		local lift = (targetBottom - bottomY)
+		if inst:IsA("Model") then
+			inst:PivotTo(inst:GetPivot() + Vector3.new(0, lift, 0))
+		else
+			inst.CFrame = inst.CFrame + Vector3.new(0, lift, 0)
+		end
+	end
+end
+
+
+local function _spawnBeamZap(fromPos: Vector3, toPos: Vector3, life: number?)
+	life = life or 0.12
+
+	local a = Instance.new("Part")
+	a.Anchored = true
+	a.CanCollide = false
+	a.CanQuery = false
+	a.CanTouch = false
+	a.Transparency = 1
+	a.Size = Vector3.new(0.2,0.2,0.2)
+	a.CFrame = CFrame.new(fromPos)
+	a.Parent = workspace
+
+	local b = a:Clone()
+	b.CFrame = CFrame.new(toPos)
+	b.Parent = workspace
+
+	local att0 = Instance.new("Attachment", a)
+	local att1 = Instance.new("Attachment", b)
+
+	local beam = Instance.new("Beam")
+	beam.Attachment0 = att0
+	beam.Attachment1 = att1
+	beam.Width0 = 0.14
+	beam.Width1 = 0.04
+	beam.FaceCamera = true
+	beam.LightEmission = 1
+	beam.Transparency = NumberSequence.new({
+		NumberSequenceKeypoint.new(0, 0.05),
+		NumberSequenceKeypoint.new(1, 1)
+	})
+	beam.Parent = a
+
+	Debris:AddItem(a, life)
+	Debris:AddItem(b, life)
+end
+
+--========================================================
+-- GROUND RAYCAST (piercing): ignores CanCollide=false objects
+--========================================================
+--========================================================
+-- GROUND RAYCAST (piercing): ignores CanCollide=false objects
+-- + ALWAYS excludes location walls for NFT logic
+--========================================================
+
+-- маленький "поиск пола" (не цепляет крышу над головой)
+local function getGroundYNearLow(pos: Vector3, rayUp: number, rayDown: number, extraExclude: {Instance}?)
+	-- тут можно просто вызвать твой getGroundYNear, но с маленьким rayUp
+	return getGroundYNear(pos, rayUp or 2.5, rayDown or 220, extraExclude)
+end
+-- Для боёвки: пол ищем "локально" (с маленьким rayUp), чтобы не ловить потолки
+local function getAttackGroundY(pos: Vector3, extraExclude: {Instance}?)
+	return getGroundYNearLow(pos, 2.5, 350, extraExclude) -- rayUp маленький = не цепляет ceiling
+end
+
+local function getCeilingYNear(pos: Vector3, rayUp: number, extraExclude: {Instance}?): (number?, Instance?)
+	local origin = pos + Vector3.new(0, 0.2, 0)
+	local dir    = Vector3.new(0, rayUp or 20, 0)
+
+	local params = RaycastParams.new()
+	params.FilterType = Enum.RaycastFilterType.Exclude
+	params.IgnoreWater = true
+
+	local ex = {}
+	local nftRoot = workspace:FindFirstChild("NFTModels")
+	if nftRoot then table.insert(ex, nftRoot) end
+
+	for _, w in ipairs(getWallsExcludeList()) do
+		table.insert(ex, w)
+	end
+
+	if extraExclude then
+		for _, inst in ipairs(extraExclude) do
+			if inst then table.insert(ex, inst) end
+		end
+	end
+
+	params.FilterDescendantsInstances = ex
+
+	local hit = workspace:Raycast(origin, dir, params)
+	if hit and hit.Instance and hit.Instance:IsA("BasePart") then
+		-- потолком считаем только collide+query
+		if hit.Instance.CanCollide == true and hit.Instance.CanQuery == true then
+			return hit.Position.Y, hit.Instance
+		end
+	end
+	return nil, nil
+end
+
+local function getModelHeight(inst: Instance): number
+	if not (inst and inst.Parent) then return 4 end
+	if inst:IsA("Model") then
+		local _, size = inst:GetBoundingBox()
+		return math.max(1, size.Y)
+	elseif inst:IsA("BasePart") then
+		return math.max(1, inst.Size.Y)
+	end
+	return 4
+end
+
+-- ✅ умный clamp: выбирает "под потолком" или "наверх"
+-- ✅ умный clamp с "липким" режимом (UNDER/TOP), без флип-флопа
+local function clampCFrameToGroundSmart(cf: CFrame, holderModel: Model, pad: number?, extraExclude: {Instance}?): CFrame
+	pad = pad or 0.45
+	local pos = cf.Position
+
+	-- safety
+	if not (holderModel and holderModel.Parent) then
+		-- fallback
+		local gy = getGroundYNear(pos, 35, 400, extraExclude)
+		local newPos = Vector3.new(pos.X, math.max(pos.Y, gy + pad), pos.Z)
+		return CFrame.new(newPos) * (cf - cf.Position)
+	end
+
+	-- высота модели + запас (сколько места нужно под потолком)
+	local heightNeed = getModelHeight(holderModel) + 0.35
+
+	-- два порога (гистерезис):
+	-- чтобы войти в UNDER нужно чуть БОЛЬШЕ места,
+	-- чтобы выйти из UNDER (и стать TOP) нужно заметно МЕНЬШЕ места.
+	local ENTER_UNDER_MARGIN = 0.55
+	local EXIT_UNDER_MARGIN  = 0.15
+
+	-- cooldown на переключение режима
+	local SWITCH_COOLDOWN = 0.45
+
+	-- текущий "липкий" режим
+	local mode = holderModel:GetAttribute("_ClampMode")
+	if mode ~= "UNDER" and mode ~= "TOP" then
+		mode = "UNDER" -- по умолчанию лучше пытаться быть снизу
+	end
+
+	local nextAllowed = holderModel:GetAttribute("_ClampModeNextAt")
+	if typeof(nextAllowed) ~= "number" then nextAllowed = 0 end
+	local now = tick()
+
+	-- 1) "низкий" пол (не цепляет крышу)
+	local groundUnderY = getGroundYNearLow(pos, 2.5, 260, extraExclude)
+
+	-- 2) потолок над точкой
+	local ceilY = getCeilingYNear(pos, 20, extraExclude)
+
+	-- клиренс, если потолок есть
+	local clearance = nil
+	if ceilY then
+		clearance = ceilY - groundUnderY
+	end
+
+	-- 3) Решение о смене режима (с гистерезисом + cooldown)
+	if now >= nextAllowed then
+		if ceilY and clearance then
+			-- если сейчас TOP, но места ПРЯМ точно хватает -> переключаемся в UNDER
+			if mode == "TOP" then
+				if clearance >= (heightNeed + ENTER_UNDER_MARGIN) then
+					mode = "UNDER"
+					holderModel:SetAttribute("_ClampMode", mode)
+					holderModel:SetAttribute("_ClampModeNextAt", now + SWITCH_COOLDOWN)
+				end
+			else
+				-- mode == UNDER
+				-- если места уже НЕ хватает (с запасом) -> переключаемся в TOP
+				if clearance <= (heightNeed + EXIT_UNDER_MARGIN) then
+					mode = "TOP"
+					holderModel:SetAttribute("_ClampMode", mode)
+					holderModel:SetAttribute("_ClampModeNextAt", now + SWITCH_COOLDOWN)
+				end
+			end
+		else
+			-- потолка нет => логично быть UNDER (обычная земля)
+			if mode ~= "UNDER" then
+				mode = "UNDER"
+				holderModel:SetAttribute("_ClampMode", mode)
+				holderModel:SetAttribute("_ClampModeNextAt", now + SWITCH_COOLDOWN)
+			end
+		end
+	end
+
+	-- 4) Применяем выбранный режим
+	if mode == "UNDER" then
+		-- под потолком: используем низкий пол
+		local newPos = Vector3.new(pos.X, math.max(pos.Y, groundUnderY + pad), pos.Z)
+		return CFrame.new(newPos) * (cf - cf.Position)
+	else
+		-- наверху: используем "глубокий" ground (может стать крышей зонта)
+		local groundTopY = getGroundYNear(pos, 35, 400, extraExclude)
+		local newPos = Vector3.new(pos.X, math.max(pos.Y, groundTopY + pad), pos.Z)
+		return CFrame.new(newPos) * (cf - cf.Position)
+	end
+end
+
+
+getGroundYNear = function(pos: Vector3, rayUp: number, rayDown: number, extraExclude: {Instance}?)
+	local origin = pos + Vector3.new(0, rayUp or 25, 0)
+	local dir    = Vector3.new(0, -(rayUp or 25) - (rayDown or 200), 0)
+
+	local params = RaycastParams.new()
+	params.FilterType = Enum.RaycastFilterType.Exclude
+	params.IgnoreWater = true
+
+	local ex = {}
+
+	-- всегда исключаем NFT-рут (чтобы не ловить своих же)
+	local nftRoot = workspace:FindFirstChild("NFTModels")
+	if nftRoot then table.insert(ex, nftRoot) end
+
+	-- ✅ ВСЕГДА исключаем стены локаций (купленные/не купленные — без разницы)
+	for _, w in ipairs(getWallsExcludeList()) do
+		table.insert(ex, w)
+	end
+
+	-- доп. исключения (персонаж, coin, holder и т.п.)
+	if extraExclude then
+		for _, inst in ipairs(extraExclude) do
+			if inst then table.insert(ex, inst) end
+		end
+	end
+
+	-- что считаем "землёй"
+	local function isValidGroundPart(p: Instance): boolean
+		if not (p and p:IsA("BasePart")) then return false end
+
+		-- ✅ всё non-collide игнорим (декор и т.п.)
+		if p.CanCollide ~= true then return false end
+
+		-- CanQuery обычно true, но оставим проверку
+		if p.CanQuery ~= true then return false end
+
+		return true
+	end
+
+	-- пробиваем луч: если попали в "не землю" — исключаем и лучим дальше
+	for _ = 1, 12 do
+		params.FilterDescendantsInstances = ex
+		local hit = workspace:Raycast(origin, dir, params)
+		if not hit then
+			return pos.Y
+		end
+
+		if isValidGroundPart(hit.Instance) then
+			return hit.Position.Y
+		end
+
+		-- не земля → исключаем конкретный Instance и продолжаем
+		table.insert(ex, hit.Instance)
+	end
+
+	return pos.Y
+end
+
+local function computePreStandCF(coin: Model, slotIndex: number, n: number, fig: Model?): CFrame
+	local coinPos = coin.PrimaryPart.Position
+	n = math.max(1, n)
+
+	local angle = ((slotIndex - 1) / n) * math.pi * 2
+	local r = COMBAT_RING_MAX
+
+	local rawPos = coinPos + Vector3.new(math.cos(angle) * r, 0, math.sin(angle) * r)
+
+	-- ✅ ВАЖНО: ищем пол маленьким rayUp, чтобы НЕ ловить потолки
+	local groundY = getAttackGroundY(rawPos, {coin, fig, workspace:FindFirstChild("NFTModels")})
+
+	local bottomOffset = 0
+	if fig and fig.Parent then
+		bottomOffset = fig:GetPivot().Position.Y - getModelBottomY(fig)
+	end
+
+	local pos = Vector3.new(rawPos.X, groundY + bottomOffset + STAND_PAD, rawPos.Z)
+
+	local cf = CFrame.lookAt(pos, Vector3.new(coinPos.X, pos.Y, coinPos.Z), Vector3.yAxis)
+	return cf
+end
+
+-- Forward declarations (чтобы верхние функции "видели" нижние)
+tweenHolderToCoinSpot = function(holder: Model, coin: Model, slotIndex: number)
+	if not (holder and holder.Parent) then return end
+	if not (coin and coin.Parent and coin.PrimaryPart) then return end
+
+	local n = math.max(1, #(holder.Parent:GetChildren()))
+	local angle = (slotIndex / n) * math.pi * 2
+
+	local radius = 10
+	local height = 2.5 + getHolderCardYOffset(holder)
+	local offset = Vector3.new(math.cos(angle)*radius, height, math.sin(angle)*radius)
+
+	local pos = coin.PrimaryPart.Position + offset
+
+	local look = Vector3.new(coin.PrimaryPart.Position.X, pos.Y, coin.PrimaryPart.Position.Z)
+	local cf = CFrame.lookAt(pos, look, Vector3.yAxis)
+
+	cf = cf
+		* CFrame.Angles(0, math.rad(CARD_YAW_DEG), 0)
+		* CFrame.Angles(math.rad(CARD_PITCH_DEG), 0, 0)
+		* CFrame.Angles(0, 0, math.rad(CARD_ROLL_DEG))
+
+	local tw = tweenPivot(holder, cf, 0.45, Enum.EasingStyle.Quad, Enum.EasingDirection.Out)
+	return tw
+end
+local function getFigureFaceYawDeg(holder: Model): number
+	local nftName = holder:GetAttribute("Nft")
+	local ov = nftName and FigureOverrides[tostring(nftName)]
+	return (ov and ov.faceYaw) or FIGURE_FACE_YAW_DEG
+end
+
+local function applyFaceYaw(cf: CFrame, yawDeg: number): CFrame
+	return cf * CFrame.Angles(0, math.rad(yawDeg or 0), 0)
+end
+
+computeHolderTargetCF = function(player: Player, index: number, t: number): CFrame?
+	local hrp = player.Character and player.Character:FindFirstChild("HumanoidRootPart")
+	if not hrp then return nil end
+
+	local baseCF = getFormationBaseCF(player)
+	if not baseCF then return nil end
+
+	local off = formationOffsets[index] or formationOffsets[#formationOffsets]
+	local backDir  = -(baseCF.LookVector)
+	local rightDir = baseCF.RightVector
+
+	local pos =
+		hrp.Position
+		+ rightDir * off.X
+		+ Vector3.new(0, off.Y, 0)
+		+ backDir  * off.Z
+
+	-- левитация
+	pos += Vector3.new(
+		math.sin(t + index) * 0.3,
+		math.sin(t*0.5 + index) * 0.5,
+		math.cos(t + index) * 0.3
+	)
+
+	local forward = Vector3.new(baseCF.LookVector.X, 0, baseCF.LookVector.Z)
+	if forward.Magnitude < 1e-3 then
+		forward = Vector3.new(0, 0, -1)
+	else
+		forward = forward.Unit
+	end
+
+	local cf = CFrame.lookAt(pos, pos + forward, Vector3.yAxis)
+
+	cf = cf
+		* CFrame.Angles(0, math.rad(CARD_YAW_DEG), 0)
+		* CFrame.Angles(math.rad(CARD_PITCH_DEG), 0, 0)
+		* CFrame.Angles(0, 0, math.rad(CARD_ROLL_DEG))
+
+	-- ❌ ВАЖНО: здесь больше НЕ делаем clampCFrameToGround(...)
+	-- потому что computeHolderTargetCF не знает высоту конкретного NFT/фигуры
+
+	return cf * HOLDER_FACE_OFFSET
+end
+
+local function _getAnimToken(fig: Instance): number
+	local v = fig:GetAttribute("_AnimToken")
+	if typeof(v) ~= "number" then
+		fig:SetAttribute("_AnimToken", 1)
+		return 1
+	end
+	return v
+end
+
+local function _bumpAnimToken(fig: Instance): number
+	local v = _getAnimToken(fig) + 1
+	fig:SetAttribute("_AnimToken", v)
+	return v
+end
+
+local _activePivotTween = setmetatable({}, {__mode="k"}) -- [Model] = {tw=Tween, conn=RBXConn, cv=CFrameValue}
+
+tweenPivot = function(model: Model, target: CFrame, timeSec: number, style, dir)
+	if not (model and model.Parent) then return nil end
+	timeSec = timeSec or 0.6
+
+	-- ✅ cancel previous tween on this model (важно!)
+	local prev = _activePivotTween[model]
+	if prev then
+		pcall(function()
+			if prev.tw then prev.tw:Cancel() end
+		end)
+		if prev.conn then prev.conn:Disconnect() end
+		if prev.cv then prev.cv:Destroy() end
+		_activePivotTween[model] = nil
+	end
+
+	local start = model:GetPivot()
+	local cv = Instance.new("CFrameValue")
+	cv.Value = start
+
+	local conn
+	conn = cv:GetPropertyChangedSignal("Value"):Connect(function()
+		if model and model.Parent then
+			model:PivotTo(cv.Value)
+		end
+	end)
+
+	local tw = TweenService:Create(
+		cv,
+		TweenInfo.new(timeSec, style or Enum.EasingStyle.Quad, dir or Enum.EasingDirection.Out),
+		{ Value = target }
+	)
+
+	_activePivotTween[model] = { tw = tw, conn = conn, cv = cv }
+
+	tw:Play()
+
+	tw.Completed:Connect(function()
+		local cur = _activePivotTween[model]
+		-- чистим только если это всё ещё текущий tween
+		if cur and cur.tw == tw then
+			if cur.conn then cur.conn:Disconnect() end
+			if cur.cv then cur.cv:Destroy() end
+			_activePivotTween[model] = nil
+		end
+	end)
+
+	return tw
+end
+
+local function cancelPivotTween(model: Model)
+	local prev = _activePivotTween[model]
+	if prev then
+		pcall(function()
+			if prev.tw then prev.tw:Cancel() end
+		end)
+		if prev.conn then prev.conn:Disconnect() end
+		if prev.cv then prev.cv:Destroy() end
+		_activePivotTween[model] = nil
+	end
+end
+
+
+--========================================================
+-- Figure detach/attach (без клона)
+--========================================================
+local DetachedFigureState = {} -- без __mode
+
+local function getHolderFigureInstance(holder: Model): Instance?
+	-- Figure может быть MeshPart/Part/Model
+	local f = holder:FindFirstChild("Figure")
+	if f then return f end
+	return holder:FindFirstChild("Figure", true)
+end
+
+local function setAnchoredRecursive(inst: Instance, anchored: boolean)
+	if inst:IsA("BasePart") then
+		inst.Anchored = anchored
+		inst.CanCollide = false
+		inst.CanQuery = false
+		inst.CanTouch = false
+	end
+	for _, d in ipairs(inst:GetDescendants()) do
+		if d:IsA("BasePart") then
+			d.Anchored = anchored
+			d.CanCollide = false
+			d.CanQuery = false
+			d.CanTouch = false
+		end
+	end
+end
+
+local function pivotToLook(inst: Instance, pos: Vector3, lookAtPos: Vector3)
+	-- ставим инстанс в pos и поворачиваем на lookAt (по плоскости Y фикс)
+	local la = Vector3.new(lookAtPos.X, pos.Y, lookAtPos.Z)
+	local dir = la - pos
+	if dir.Magnitude < 1e-3 then dir = Vector3.new(0,0,-1) end
+	local cf = CFrame.lookAt(pos, pos + dir, Vector3.yAxis)
+
+	if inst:IsA("Model") then
+		inst:PivotTo(cf)
+	elseif inst:IsA("BasePart") then
+		inst.CFrame = cf
+	end
+end
+
+local function collectAndRemoveWeldsToHolder(fig: Instance, holder: Model)
+	local saved = {}
+
+	local function isHolderPart(p: BasePart)
+		return p and p:IsDescendantOf(holder) and (not p:IsDescendantOf(fig))
+	end
+	local function isFigPart(p: BasePart)
+		return p and p:IsDescendantOf(fig)
+	end
+
+	local function maybeSave(w: Instance, a: BasePart?, b: BasePart?)
+		if not (a and b) then return end
+
+		-- нам нужен weld "часть фигуры <-> часть холдера"
+		local ok =
+			(isFigPart(a) and isHolderPart(b)) or
+			(isFigPart(b) and isHolderPart(a))
+
+		if not ok then return end
+
+		saved[#saved+1] = {
+			class  = w.ClassName,
+			part0  = a,
+			part1  = b,
+			parent = w.Parent,
+			name   = w.Name,
+			c0     = (w:IsA("Motor6D") and w.C0) or nil,
+			c1     = (w:IsA("Motor6D") and w.C1) or nil,
+		}
+		w:Destroy()
+	end
+
+	for _, d in ipairs(_iterSelfAndDescendants(fig)) do
+		if d:IsA("WeldConstraint") then
+			maybeSave(d, d.Part0, d.Part1)
+		elseif d:IsA("Weld") then
+			maybeSave(d, d.Part0, d.Part1)
+		elseif d:IsA("Motor6D") then
+			maybeSave(d, d.Part0, d.Part1)
+		end
+	end
+
+	return saved
+end
+
+
+
+local function getPivotCF(inst: Instance): CFrame?
+	if inst:IsA("Model") then
+		return inst:GetPivot()
+	elseif inst:IsA("BasePart") then
+		return inst.CFrame
+	end
+	return nil
+end
+
+local function setPivotCF(inst: Instance, cf: CFrame)
+	if inst:IsA("Model") then
+		inst:PivotTo(cf)
+	elseif inst:IsA("BasePart") then
+		inst.CFrame = cf
+	end
+end
+
+local function collectAndRemoveWeldsBetween(fig: Instance, mount: BasePart)
+	-- Сохраняем weld’ы, которые связывают фигуру с mount, и удаляем их
+	local saved = {}
+
+	local function maybeSaveWeld(w: Instance, partA: BasePart?, partB: BasePart?)
+		if not (partA and partB) then return end
+		-- если weld соединяет mount <-> part фигуры
+		local aIsMount = (partA == mount)
+		local bIsMount = (partB == mount)
+		if not (aIsMount or bIsMount) then return end
+
+		local other = aIsMount and partB or partA
+		-- other должен быть частью фигуры
+		if not (other and other:IsDescendantOf(fig)) then return end
+
+		table.insert(saved, {
+			class = w.ClassName,
+			part0 = partA,
+			part1 = partB,
+			parent = w.Parent,
+			name = w.Name,
+			c0 = (w:IsA("Motor6D") and w.C0) or nil,
+			c1 = (w:IsA("Motor6D") and w.C1) or nil,
+		})
+		w:Destroy()
+	end
+
+	-- Вариант 1: WeldConstraint
+	for _, d in ipairs(fig:GetDescendants()) do
+		if d:IsA("WeldConstraint") then
+			maybeSaveWeld(d, d.Part0, d.Part1)
+		elseif d:IsA("Weld") then
+			maybeSaveWeld(d, d.Part0, d.Part1)
+		elseif d:IsA("Motor6D") then
+			maybeSaveWeld(d, d.Part0, d.Part1)
+		end
+	end
+
+	return saved
+end
+
+local function restoreWelds(saved)
+	for _, s in ipairs(saved or {}) do
+		local cls = s.class
+		local w = Instance.new(cls)
+		w.Name = s.name or cls
+		if w:IsA("WeldConstraint") then
+			w.Part0 = s.part0
+			w.Part1 = s.part1
+		elseif w:IsA("Weld") then
+			w.Part0 = s.part0
+			w.Part1 = s.part1
+			-- Weld имеет C0/C1 тоже, но обычно не нужно; если надо — допишем
+		elseif w:IsA("Motor6D") then
+			w.Part0 = s.part0
+			w.Part1 = s.part1
+			w.C0 = s.c0 or CFrame.new()
+			w.C1 = s.c1 or CFrame.new()
+		end
+		w.Parent = s.parent or (s.part1 or s.part0)
+	end
+end
+
+local function detachFigureFromHolder(holder: Model): (Instance?, BasePart?, any?)
+	local existed = DetachedFigureState[holder]
+	if existed and existed.fig and existed.fig.Parent and existed.mount and existed.mount.Parent then
+		return existed.fig, existed.mount, existed
+	end
+	local fig = getHolderFigureInstance(holder)
+	if not fig then return nil end
+
+	local mount = holder:FindFirstChild("NftFigureMount", true)
+	if not (mount and mount:IsA("BasePart")) then return nil end
+
+
+	local pivot = getPivotCF(fig)
+
+	local state = {
+		fig = fig,
+		mount = mount,
+		parent = fig.Parent,
+		pivot = pivot,
+		-- ✅ офсет фигуры относительно mount (чтобы потом вернуть ровно как было)
+		localOffset = (pivot and mount.CFrame:ToObjectSpace(pivot)) or CFrame.new(),
+		welds = collectAndRemoveWeldsToHolder(fig, holder),
+	}
+
+	fig.Parent = holder.Parent
+	do
+		local ov = fig:FindFirstChild("OwnerHolder")
+		if not ov then
+			ov = Instance.new("ObjectValue")
+			ov.Name = "OwnerHolder"
+			ov.Parent = fig
+		end
+		ov.Value = holder
+	end
+
+	local startCF = holder:GetPivot()
+	setPivotCF(fig, startCF)
+
+	setAnchoredRecursive(fig, true)
+
+	DetachedFigureState[holder] = state
+
+	-- ✅ если бой уже закончился, а dettach произошёл поздно — сразу вернуть
+	if holder:GetAttribute("_NeedReattach") == true then
+		holder:SetAttribute("_NeedReattach", nil)
+		reattachFigureToHolder(holder)
+		return fig, mount, state
+	end
+
+	return fig, mount, state
+end
+
+reattachFigureToHolder = function(holder: Model)
+	if not (holder and holder.Parent) then return end
+
+	local st = DetachedFigureState[holder]
+
+	-- helper: проверить что фигура реально привязана к mount
+	local function hasMountWeld(fig: Instance, mount: BasePart): boolean
+		for _, d in ipairs(fig:GetDescendants()) do
+			if d:IsA("WeldConstraint") then
+				if (d.Part0 == mount and d.Part1 and d.Part1:IsDescendantOf(fig))
+					or (d.Part1 == mount and d.Part0 and d.Part0:IsDescendantOf(fig))
+				then
+					return true
+				end
+			end
+		end
+		return false
+	end
+
+	-- ✅ нет state: не оставляем флаг, но и не даём фигуре жить отдельно
+	if not st then
+		holder:SetAttribute("_NeedReattach", nil)
+		hardRebuildFigure(holder)
+		warn("[REATTACH] no state for", holder.Name, "-> hard rebuild")
+		return
+	end
+
+	local fig = st.fig
+	local mount = st.mount
+
+	if not (fig and fig.Parent and mount and mount.Parent) then
+		DetachedFigureState[holder] = nil
+		holder:SetAttribute("_NeedReattach", nil)
+		hardRebuildFigure(holder)
+		warn("[REATTACH] broken state for", holder.Name, "-> hard rebuild")
+		return
+	end
+
+	-- 1) вернуть под holder
+	fig.Parent = holder
+
+	-- 2) поставить точно как было
+	local targetCF = mount.CFrame * (st.localOffset or CFrame.new())
+	setPivotCF(fig, targetCF)
+
+	-- 3) восстановить weld’ы
+	restoreWelds(st.welds)
+
+	-- 4) снять anchored
+	setAnchoredRecursive(fig, false)
+	if fig:IsA("Model") then ensurePrimary(fig) end
+
+	DetachedFigureState[holder] = nil
+	holder:SetAttribute("_NeedReattach", nil)
+
+	-- ✅ ФИНАЛЬНАЯ ВАЛИДАЦИЯ: если weld’ов к mount нет — пересобираем
+	local figNow = getHolderFigureInstance(holder)
+	if not figNow then
+		hardRebuildFigure(holder)
+		return
+	end
+	local mountNow = holder:FindFirstChild("NftFigureMount", true)
+	if mountNow and mountNow:IsA("BasePart") then
+		if not hasMountWeld(figNow, mountNow) then
+			hardRebuildFigure(holder)
+		end
+	end
+end
+
+--========================================================
+-- [CANCEL TOKEN] Attack epoch helpers
+--========================================================
+local function getAttackEpoch(holder: Model): number
+	local v = holder:GetAttribute("_AttackEpoch")
+	if typeof(v) ~= "number" then
+		holder:SetAttribute("_AttackEpoch", 0)
+		return 0
+	end
+	return v
+end
+
+local function bumpAttackEpoch(holder: Model): number
+	local v = getAttackEpoch(holder) + 1
+	holder:SetAttribute("_AttackEpoch", v)
+	return v
+end
+
+--========================================================
+-- FULL REPLACEMENT: startAttackerVisuals (with epoch cancel)
+--========================================================
+local function startAttackerVisuals(player: Player, coin: Model, state, holder: Model, slotIndex: number)
+	if not (holder and holder.Parent and coin and coin.Parent and coin.PrimaryPart) then return end
+
+	state.holderTweens = state.holderTweens or {}
+
+	-- ✅ cancel previous tween on holder
+	if state.holderTweens[holder] then
+		pcall(function() state.holderTweens[holder]:Cancel() end)
+		state.holderTweens[holder] = nil
+	end
+	cancelPivotTween(holder)
+
+	-- ✅ store epoch for this "attack start"
+	state._attackEpoch = state._attackEpoch or {}
+	local epochNow = getAttackEpoch(holder)
+	state._attackEpoch[holder] = epochNow
+
+	local function canceled(): boolean
+		if not (holder and holder.Parent) then return true end
+		if not (state and state._attackEpoch) then return true end
+		return getAttackEpoch(holder) ~= (state._attackEpoch[holder] or 0)
+	end
+
+	-- ✅ tween holder to coin spot
+	local holderTw = tweenHolderToCoinSpot(holder, coin, slotIndex)
+	state.holderTweens[holder] = holderTw
+
+	state.attackFigures = state.attackFigures or {}
+	if state.attackFigures[holder] and state.attackFigures[holder].Parent then
+		return
+	end
+
+	state._attackBoot = state._attackBoot or {}
+	if state._attackBoot[holder] then return end
+	state._attackBoot[holder] = true
+
+	task.spawn(function()
+		-- wait arrival
+		if holderTw then
+			pcall(function() holderTw.Completed:Wait() end)
+		else
+			task.wait(0.45)
+		end
+
+		if canceled() then
+			state._attackBoot[holder] = nil
+			return
+		end
+
+		task.wait(0.10)
+		if canceled() then
+			state._attackBoot[holder] = nil
+			return
+		end
+
+		-- ✅ if already requested reattach or removed from state => abort
+		if holder:GetAttribute("_NeedReattach") == true then
+			state._attackBoot[holder] = nil
+			return
+		end
+
+		if not (holder and holder.Parent and coin and coin.Parent and coin.PrimaryPart) then
+			state._attackBoot[holder] = nil
+			return
+		end
+		if not (ActiveAttacks[coin] == state) then
+			state._attackBoot[holder] = nil
+			return
+		end
+		if not table.find(state.attackers or {}, holder) then
+			state._attackBoot[holder] = nil
+			return
+		end
+		if canceled() then
+			state._attackBoot[holder] = nil
+			return
+		end
+
+		-- ✅ DETACH (but only if not canceled)
+		local fig = detachFigureFromHolder(holder)
+		if canceled() then
+			-- если отменили ровно в момент detach — сразу пытаемся вернуть
+			holder:SetAttribute("_NeedReattach", true)
+			pcall(function() reattachFigureToHolder(holder) end)
+			state._attackBoot[holder] = nil
+			return
+		end
+
+		if not fig then
+			state._attackBoot[holder] = nil
+			return
+		end
+
+		state.attackFigures[holder] = fig
+
+		local stand = fig:FindFirstChild("AttackStandCF")
+		if not stand then
+			stand = Instance.new("CFrameValue")
+			stand.Name = "AttackStandCF"
+			stand.Parent = fig
+		end
+
+		local ready = fig:FindFirstChild("AttackReady")
+		if not ready then
+			ready = Instance.new("BoolValue")
+			ready.Name = "AttackReady"
+			ready.Parent = fig
+		end
+		ready.Value = false
+
+		local n = math.max(1, #(state.attackers or {}))
+		fig:SetAttribute("SlotIndex", slotIndex)
+		fig:SetAttribute("SlotCount", n)
+
+		if fig:GetAttribute("StandJitter") == nil then
+			fig:SetAttribute("StandJitter", (math.random() * 2 - 1))
+		end
+		if fig:GetAttribute("StandRadius") == nil then
+			local rr = COMBAT_RING_MIN + (COMBAT_RING_MAX - COMBAT_RING_MIN) * (0.55 + math.random() * 0.35)
+			fig:SetAttribute("StandRadius", rr)
+		end
+
+		local preStandCF = computePreStandCF(coin, slotIndex, n, (fig:IsA("Model") and fig or nil))
+		preStandCF = applyFaceYaw(preStandCF, getFigureFaceYawDeg(holder))
+		stand.Value = preStandCF
+
+		local jumpModel: Model
+		local tmpWrap: Model? = nil
+		if fig:IsA("Model") then
+			jumpModel = fig
+		elseif fig:IsA("BasePart") then
+			local m = Instance.new("Model")
+			m.Name = "_TmpFigModel"
+			fig.Parent = m
+			m.PrimaryPart = fig
+			m.Parent = workspace
+			jumpModel = m
+			tmpWrap = m
+		else
+			state._attackBoot[holder] = nil
+			return
+		end
+		ensurePrimary(jumpModel)
+
+		if canceled() then
+			-- отменили до прыжка -> вернуть
+			holder:SetAttribute("_NeedReattach", true)
+			pcall(function() reattachFigureToHolder(holder) end)
+			if tmpWrap and tmpWrap.Parent then tmpWrap:Destroy() end
+			state._attackBoot[holder] = nil
+			return
+		end
+
+		local fromCF = holder:GetPivot()
+		local toCF   = preStandCF
+
+		arcJump(jumpModel, fromCF, toCF)
+
+		if canceled() then
+			holder:SetAttribute("_NeedReattach", true)
+			pcall(function() reattachFigureToHolder(holder) end)
+			if tmpWrap and tmpWrap.Parent then tmpWrap:Destroy() end
+			state._attackBoot[holder] = nil
+			return
+		end
+
+		clampModelToGroundByBBoxForAttack(jumpModel, 0.18, {coin, holder, workspace:FindFirstChild("NFTModels")})
+
+		do
+			local cur = jumpModel:GetPivot()
+			local down = cur * CFrame.new(0, -0.10, 0)
+
+			local tw = tweenModelPivot(jumpModel, down, 0.08, Enum.EasingStyle.Quad, Enum.EasingDirection.In)
+			if tw then pcall(function() tw.Completed:Wait() end) end
+			if canceled() then
+				holder:SetAttribute("_NeedReattach", true)
+				pcall(function() reattachFigureToHolder(holder) end)
+				if tmpWrap and tmpWrap.Parent then tmpWrap:Destroy() end
+				state._attackBoot[holder] = nil
+				return
+			end
+
+			local tw2 = tweenModelPivot(jumpModel, cur, 0.12, Enum.EasingStyle.Back, Enum.EasingDirection.Out)
+			if tw2 then pcall(function() tw2.Completed:Wait() end) end
+			if canceled() then
+				holder:SetAttribute("_NeedReattach", true)
+				pcall(function() reattachFigureToHolder(holder) end)
+				if tmpWrap and tmpWrap.Parent then tmpWrap:Destroy() end
+				state._attackBoot[holder] = nil
+				return
+			end
+		end
+
+		if tmpWrap and tmpWrap.Parent then
+			local part = tmpWrap.PrimaryPart
+			part.Parent = holder.Parent
+			tmpWrap:Destroy()
+		end
+
+		ready.Value = true
+		state._attackBoot[holder] = nil
+	end)
+end
+clampModelToGroundByBBoxForAttack = function(inst: Instance, pad: number?, extraExclude: {Instance}?)
+	pad = pad or 0.18
+
+	local cf, size
+	if inst:IsA("Model") then
+		cf, size = inst:GetBoundingBox()
+	elseif inst:IsA("BasePart") then
+		cf, size = inst.CFrame, inst.Size
+	else
+		return
+	end
+
+	local bottomY = cf.Position.Y - (size.Y * 0.5)
+
+	-- ✅ маленький rayUp
+	local groundY = getGroundYNear(cf.Position, 2.5, 500, extraExclude)
+
+	local targetBottom = groundY + pad
+	if bottomY < targetBottom then
+		local lift = (targetBottom - bottomY)
+		if inst:IsA("Model") then
+			inst:PivotTo(inst:GetPivot() + Vector3.new(0, lift, 0))
+		else
+			inst.CFrame = inst.CFrame + Vector3.new(0, lift, 0)
+		end
+	end
+end
+
+
+local function stopAttackerVisuals(player: Player, state, holder: Model)
+	bumpAttackEpoch(holder)
+
+	if not (holder and holder.Parent) then return end
+
+	-- ✅ ЖЁСТКИЙ ЛОК: пока реаттачим — холдер нельзя двигать follow’ом
+	holder:SetAttribute("_ReattachLock", true)
+	NFTBusy[holder] = true
+
+	-- стопнуть твины “к монете” и любые текущие pivot tweens холдера
+	if state and state.holderTweens and state.holderTweens[holder] then
+		pcall(function() state.holderTweens[holder]:Cancel() end)
+		state.holderTweens[holder] = nil
+	end
+	cancelPivotTween(holder)
+
+	-- ✅ 0) УБИТЬ ЖИВЫЕ АНИМАЦИИ ATTACK-FIGURE (самая причина бага)
+	local fig = state and state.attackFigures and state.attackFigures[holder]
+	if fig and fig.Parent then
+		_bumpAnimToken(fig) -- любые старые playAttackHit после yield умрут
+
+		if fig:IsA("Model") then
+			cancelModelPivotTween(fig)
+		elseif fig:IsA("BasePart") then
+			local m = fig:FindFirstAncestorOfClass("Model")
+			if m then cancelModelPivotTween(m) end
+		end
+	end
+
+	-- если был detach или boot — попросим реаттач
+	local need = false
+	if DetachedFigureState[holder] ~= nil then
+		need = true
+	elseif state and state._attackBoot and state._attackBoot[holder] then
+		need = true
+	end
+	holder:SetAttribute("_NeedReattach", need and true or nil)
+
+	-- ✅ 1) СНАЧАЛА вернуть фигуру (на неподвижном холдере)
+	reattachFigureToHolder(holder)
+
+	-- ✅ 2) очистить ссылки
+	if state and state.attackFigures then
+		state.attackFigures[holder] = nil
+	end
+
+	-- ✅ 3) отпустить lock и увести холдер обратно в формацию
+	holder:SetAttribute("_ReattachLock", nil)
+
+	local idx = table.find(EquippedNFTs[player] or {}, holder) or 1
+	local targetCF = computeHolderTargetCF(player, idx, tick())
+	if targetCF then
+		tweenPivot(holder, targetCF, 0.6, Enum.EasingStyle.Quad, Enum.EasingDirection.Out)
+	end
+end
+
+
+local function getEquippedUuidList(player)
+	local res = {}
+	for _, m in ipairs(EquippedNFTs[player] or {}) do
+		if m and m.Parent then table.insert(res, m.Name) end
+	end
+	return res
+end
+local function weldTo(part0: BasePart, part1: BasePart)
+	local w = Instance.new("WeldConstraint")
+	w.Part0 = part0
+	w.Part1 = part1
+	w.Parent = part1
+	return w
+end
+
+
+local function attachFigureToHolder(holder: Model, nftName: string)
+	local mount = holder:FindFirstChild("NftFigureMount", true)
+	if not (mount and mount:IsA("BasePart")) then
+		warn("NftFigureMount missing in holder")
+		return nil
+	end
+
+	local src = NftFiguresModels:FindFirstChild(nftName)
+	if not src then
+		warn("Figure model missing:", nftName)
+		return nil
+	end
+
+	-- клоним исходник
+	local figRaw = src:Clone()
+
+	-- гарантируем: Figure = Model
+	local figModel: Model
+	if figRaw:IsA("Model") then
+		figModel = figRaw
+	else
+		-- если в NftFiguresModels лежит MeshPart/Part -> оборачиваем в Model
+		local m = Instance.new("Model")
+		m.Name = "Figure"
+
+		figRaw.Name = "FigurePart"
+		figRaw.Parent = m
+
+		-- primary part
+		if figRaw:IsA("BasePart") then
+			m.PrimaryPart = figRaw
+		else
+			local p = m:FindFirstChildWhichIsA("BasePart", true)
+			if p then m.PrimaryPart = p end
+		end
+
+		figModel = m
+	end
+
+	figModel.Name = "Figure"
+	figModel.Parent = holder
+
+	-- применяем override если есть
+	local ov = FigureOverrides[nftName] or getFigureOverride(nftName)
+
+	local offset = ov and ov.offset or CFrame.new()
+
+	-- ставим по mount
+	figModel:PivotTo(mount.CFrame * offset)
+
+	-- weld: все BasePart фигуры к mount (чтобы летало как единое)
+	for _, p in ipairs(figModel:GetDescendants()) do
+		if p:IsA("BasePart") then
+			p.Anchored = false
+			p.CanCollide = false
+			p.CanQuery = false
+			p.CanTouch = false
+			weldTo(mount, p)
+		end
+	end
+
+	-- scale если нужно
+	if ov and ov.scale then
+		pcall(function()
+			figModel:ScaleTo(ov.scale)
+			figModel:PivotTo(mount.CFrame * offset) -- важно: после ScaleTo вернуть в mount
+		end)
+	end
+
+	return figModel
+end
+
+-- поиск модели по uuid (одна на игрока)
+local function findEquippedModelByUuid(player: Player, uuid: string)
+	for i, m in ipairs(EquippedNFTs[player] or {}) do
+		if m and m.Parent and m.Name == uuid then
+			return i, m
+		end
+	end
+	return nil, nil
+end
+
+
+
+--========================================================
+-- Save helpers
+--========================================================
+local function _doPersistNow(player, payloadOverride)
+	local key = tostring(player.UserId)
+	local payload = payloadOverride or getEquippedUuidList(player)
+	local ok, err = pcall(function()
+		EquippedStore:SetAsync(key, payload)
+	end)
+	if ok then
+		_pendingDirty[player] = false
+	else
+		warn("[EquippedStore] SetAsync failed:", err)
+	end
+	return ok
+end
+hardRebuildFigure = function(holder: Model)
+	if not (holder and holder.Parent) then return end
+
+	-- 1) удалить фигуру внутри holder (если осталась)
+	local inside = getHolderFigureInstance(holder)
+	if inside and inside.Parent then
+		inside:Destroy()
+	end
+
+	-- 2) удалить "оторванную" фигуру рядом (OwnerHolder == holder)
+	local parent = holder.Parent
+	if parent then
+		for _, inst in ipairs(parent:GetChildren()) do
+			local ov = inst:FindFirstChild("OwnerHolder")
+			if ov and ov:IsA("ObjectValue") and ov.Value == holder then
+				inst:Destroy()
+			end
+		end
+	end
+
+	-- 3) пересоздать фигуру по атрибуту Nft
+	local nftName = holder:GetAttribute("Nft")
+	if nftName and tostring(nftName) ~= "" then
+		attachFigureToHolder(holder, tostring(nftName))
+	end
+end
+
+-- ✅ один активный tween на Model (attack figure и т.п.)
+local _activeModelPivotTween = setmetatable({}, {__mode="k"}) -- [Model] = {tw, conn, cv}
+
+cancelModelPivotTween = function(model: Model)
+	local prev = _activeModelPivotTween[model]
+	if prev then
+		pcall(function()
+			if prev.tw then prev.tw:Cancel() end
+		end)
+		if prev.conn then prev.conn:Disconnect() end
+		if prev.cv then prev.cv:Destroy() end
+		_activeModelPivotTween[model] = nil
+	end
+end
+
+tweenModelPivot = function(model: Model, target: CFrame, timeSec: number, style, dir)
+	if not (model and model.Parent) then return nil end
+	timeSec = timeSec or 0.2
+
+	-- ✅ cancel previous tween on this model
+	cancelModelPivotTween(model)
+
+	local cv = Instance.new("CFrameValue")
+	cv.Value = model:GetPivot()
+
+	local conn = cv:GetPropertyChangedSignal("Value"):Connect(function()
+		if model and model.Parent then
+			model:PivotTo(cv.Value)
+		end
+	end)
+
+	local tw = TweenService:Create(
+		cv,
+		TweenInfo.new(timeSec, style or Enum.EasingStyle.Quad, dir or Enum.EasingDirection.Out),
+		{ Value = target }
+	)
+
+	_activeModelPivotTween[model] = { tw = tw, conn = conn, cv = cv }
+
+	tw:Play()
+	tw.Completed:Connect(function()
+		local cur = _activeModelPivotTween[model]
+		if cur and cur.tw == tw then
+			if cur.conn then cur.conn:Disconnect() end
+			if cur.cv then cur.cv:Destroy() end
+			_activeModelPivotTween[model] = nil
+		end
+	end)
+
+	return tw
+end
+
+
+local function saveEquippedDebounced(player)
+	_pendingDirty[player] = true
+	if _suppressSave[player] then return end
+	if _saveDebounce[player] then task.cancel(_saveDebounce[player]) end
+	local now = tick()
+	local earliest = math.max(0, (_saveDueAt[player] or 0) - now)
+	local delaySec = math.max(0.6, earliest)
+	_saveDebounce[player] = task.delay(delaySec, function()
+		_saveDebounce[player] = nil
+		if _suppressSave[player] then return end
+		if not _pendingDirty[player] then return end
+		if _doPersistNow(player) then
+			_saveDueAt[player] = tick() + MIN_SAVE_INTERVAL
+		end
+	end)
+end
+
+SetEquipSaveSuppressed.OnServerEvent:Connect(function(player, on)
+	_suppressSave[player] = (on == true)
+	if not _suppressSave[player] then
+		if _pendingDirty[player] then
+			if _doPersistNow(player) then
+				_saveDueAt[player] = tick() + MIN_SAVE_INTERVAL
+			end
+		end
+	end
+end)
+
+--========================================================
+-- Utils (spawn visuals etc.)
+--========================================================
+local NftCrusts  = {
+	Default = { Mesh = CrustsTemplates:WaitForChild("DefaultCrust") },
+	Silver  = { Mesh = CrustsTemplates:WaitForChild("SilverCrust") },
+	Gold    = { Mesh = CrustsTemplates:WaitForChild("GoldenCrust") },
+	Rainbow = { Mesh = CrustsTemplates:WaitForChild("RainbowCrust") },
+}
+
+--========================================================
+-- Crust apply (рамка/подложка из шаблонов)
+--========================================================
+
+local function _getCrustTemplateByName(crustName: string?): Instance?
+	crustName = tostring(crustName or "Default")
+	local row = NftCrusts[crustName] or NftCrusts.Default
+	return row and row.Mesh or nil
+end
+
+local function _getBBoxSize(inst: Instance): Vector3
+	if inst:IsA("BasePart") then
+		return inst.Size
+	elseif inst:IsA("Model") then
+		local _, size = inst:GetBoundingBox()
+		return size
+	end
+	return Vector3.new(1,1,1)
+end
+
+local function _setBBoxSizeTo(inst: Instance, targetSize: Vector3)
+	if inst:IsA("BasePart") then
+		-- MeshPart/Part
+		inst.Size = targetSize
+	elseif inst:IsA("Model") then
+		-- ScaleTo по отношению к bbox
+		local _, sz = inst:GetBoundingBox()
+		if sz.X <= 0 or sz.Y <= 0 or sz.Z <= 0 then return end
+		local kx, ky, kz = targetSize.X / sz.X, targetSize.Y / sz.Y, targetSize.Z / sz.Z
+		-- ScaleTo принимает единый коэффициент, поэтому берём средний/минимальный (чтобы не расползалось)
+		local k = math.min(kx, ky, kz)
+		if k > 0 then
+			pcall(function() inst:ScaleTo(k) end)
+		end
+	end
+end
+
+local function applyCrustToHolder(holder: Model, crustName: string?)
+	if not (holder and holder.Parent) then return nil end
+
+	-- 0) обязателен BackgroundPart (он же "якорь" для рамки)
+	local bgPart = holder:FindFirstChild("BackgroundPart", true)
+	if not (bgPart and bgPart:IsA("BasePart")) then
+		warn("[Crust] BackgroundPart missing in holder:", holder:GetFullName())
+		return nil
+	end
+
+	-- 1) удалить старую рамку
+	local old = holder:FindFirstChild("CrustVisual")
+	if old then old:Destroy() end
+
+	-- 2) взять шаблон рамки
+	local templ = _getCrustTemplateByName(crustName)
+	if not templ then
+		warn("[Crust] template missing for:", tostring(crustName))
+		return nil
+	end
+
+	-- 3) склонировать
+	local crust = templ:Clone()
+	crust.Name = "CrustVisual"
+	crust.Parent = holder
+
+	-- 4) привести к Model (чтобы PivotTo работал одинаково)
+	local crustModel: Model
+	if crust:IsA("Model") then
+		crustModel = crust
+	else
+		local m = Instance.new("Model")
+		m.Name = "CrustVisual"
+		crust.Parent = m
+		m.Parent = holder
+		crustModel = m
+	end
+	ensurePrimary(crustModel) -- пусть будет, но мы pivot делаем через Model
+
+	-- 5) поставить рамку ровно в BackgroundPart
+	-- +90 градусов вокруг Y (вертикальной оси)
+	crustModel:PivotTo(
+		bgPart.CFrame * CFrame.Angles(0, 0, math.rad(90))
+	)
+
+
+	-- 6) отключить физику и приварить к BackgroundPart
+	for _, p in ipairs(crustModel:GetDescendants()) do
+		if p:IsA("BasePart") then
+			p.Anchored = false
+			p.CanCollide = false
+			p.CanQuery = false
+			p.CanTouch = false
+			weldTo(bgPart, p)
+		end
+	end
+
+	return crustModel
+end
+
+local function _makeTempTrail(figModel: Model)
+	local pp = figModel.PrimaryPart or figModel:FindFirstChildWhichIsA("BasePart", true)
+	if not pp then return nil end
+
+	local a0 = Instance.new("Attachment")
+	a0.Name = "TrailA0"
+	a0.Position = Vector3.new(0, 0.18, 0)
+	a0.Parent = pp
+
+	local a1 = Instance.new("Attachment")
+	a1.Name = "TrailA1"
+	a1.Position = Vector3.new(0, -0.18, 0)
+	a1.Parent = pp
+
+	local tr = Instance.new("Trail")
+	tr.Attachment0 = a0
+	tr.Attachment1 = a1
+	tr.Lifetime = 0.10      -- ✅ было 0.18
+	tr.MinLength = 0.35     -- чуть плотнее, но короче
+	tr.Enabled = true
+	tr.Parent = pp
+
+	return {trail = tr, a0 = a0, a1 = a1}
+end
+
+--========================================================
+-- FIXED: combat stand (stable jitter per figure)
+--========================================================
+local function computeCombatStandCF(coin: Model, holder: Model?, slotIndex: number, n: number, fig: Model?): CFrame?
+	-- ✅ coin может уже умереть/удалиться, либо PrimaryPart может быть nil
+	if not (coin and coin.Parent) then return nil end
+
+	local pp = coin.PrimaryPart
+	if not (pp and pp:IsA("BasePart")) then
+		-- пробуем найти любой BasePart как fallback
+		pp = coin:FindFirstChildWhichIsA("BasePart", true)
+		if pp and pp:IsA("BasePart") then
+			coin.PrimaryPart = pp
+		else
+			return nil
+		end
+	end
+
+	local coinPos = pp.Position
+	n = math.max(1, n)
+
+	local baseAngle = ((slotIndex - 1) / n) * math.pi * 2
+
+	-- стабильный jitter (один раз задаём атрибутом)
+	local jitterSeed = 0
+	if fig and fig.Parent then
+		local v = fig:GetAttribute("StandJitter")
+		if typeof(v) == "number" then jitterSeed = math.clamp(v, -1, 1) end
+	end
+	local angle = baseAngle + jitterSeed * math.rad(18)
+
+	-- стабильный радиус (один раз задаём атрибутом)
+	local r = COMBAT_RING_MIN + (COMBAT_RING_MAX - COMBAT_RING_MIN) * 0.65
+	if fig and fig.Parent then
+		local rv = fig:GetAttribute("StandRadius")
+		if typeof(rv) == "number" then
+			r = math.clamp(rv, COMBAT_RING_MIN, COMBAT_RING_MAX)
+		end
+	end
+
+	local rawPos = coinPos + Vector3.new(math.cos(angle) * r, 0, math.sin(angle) * r)
+
+	local groundY = getAttackGroundY(rawPos, {coin, fig, workspace:FindFirstChild("NFTModels")})
+
+	local bottomOffset = 0
+	if fig and fig.Parent then
+		bottomOffset = fig:GetPivot().Position.Y - getModelBottomY(fig)
+	end
+
+	local pos = Vector3.new(rawPos.X, groundY + bottomOffset + STAND_PAD, rawPos.Z)
+
+	local cf = CFrame.lookAt(pos, Vector3.new(coinPos.X, pos.Y, coinPos.Z), Vector3.yAxis)
+	if holder then
+		cf = applyFaceYaw(cf, getFigureFaceYawDeg(holder))
+	end
+	return cf
+end
+
+
+
+local function _spawnHitFlash(pos: Vector3)
+	local p = Instance.new("Part")
+	p.Anchored = true
+	p.CanCollide = false
+	p.CanQuery = false
+	p.CanTouch = false
+	p.Material = Enum.Material.Neon
+	p.Shape = Enum.PartType.Ball
+	p.Size = Vector3.new(0.35, 0.35, 0.35)
+	p.Transparency = 0.15
+	p.CFrame = CFrame.new(pos)
+	p.Parent = workspace
+
+	local tw1 = TweenService:Create(p, TweenInfo.new(0.07, Enum.EasingStyle.Quad, Enum.EasingDirection.Out), {
+		Size = Vector3.new(2.2, 2.2, 2.2),
+		Transparency = 0.85
+	})
+	local tw2 = TweenService:Create(p, TweenInfo.new(0.10, Enum.EasingStyle.Quad, Enum.EasingDirection.In), {
+		Size = Vector3.new(3.2, 3.2, 3.2),
+		Transparency = 1
+	})
+
+	tw1:Play()
+	tw1.Completed:Connect(function() tw2:Play() end)
+	Debris:AddItem(p, 0.25)
+end
+
+local function _spawnGlitchBits(pos: Vector3)
+	for i=1, math.random(4,7) do
+		local p = Instance.new("Part")
+		p.Anchored = true
+		p.CanCollide = false
+		p.CanQuery = false
+		p.CanTouch = false
+		p.Material = Enum.Material.Neon
+		p.Size = Vector3.new(0.12, 0.12, 0.12)
+		p.Transparency = 0.05
+		p.CFrame = CFrame.new(pos + Vector3.new((math.random()-0.5)*0.6, math.random()*0.5, (math.random()-0.5)*0.6))
+		p.Parent = workspace
+
+		local goalCF = p.CFrame * CFrame.new((math.random()-0.5)*2.2, math.random()*1.2, (math.random()-0.5)*2.2)
+		TweenService:Create(p, TweenInfo.new(0.22, Enum.EasingStyle.Quad, Enum.EasingDirection.Out), {
+			CFrame = goalCF,
+			Transparency = 1
+		}):Play()
+		Debris:AddItem(p, 0.26)
+	end
+end
+--========================================================
+-- NEW: Coin wobble (spring) - устойчиво к мульти-ударам
+--========================================================
+local CoinWobble = setmetatable({}, {__mode="k"}) -- [coin] = state
+local function _spawnCritFX(pos: Vector3, coin: Model?, attacker: Model?)
+	_spawnHitFlash(pos)
+	_spawnHitFlash(pos + Vector3.new(0, 0.55, 0))
+	_spawnHitFlash(pos + Vector3.new(0, 1.05, 0))
+
+	local g = clampPosToGround(pos, 0.12, {coin, attacker})
+	_spawnShockwave(g)
+	_spawnShockwave(g + Vector3.new(0, 0.06, 0))
+	_spawnShockwave(g + Vector3.new(0, 0.12, 0))
+
+	_spawnImpactBurst(pos)
+	_spawnImpactBurst(pos + Vector3.new(0, 0.35, 0))
+	_spawnGlitchBits(pos)
+
+	-- 2-3 “молнии” вокруг
+	for i=1, math.random(2,3) do
+		local a = pos + Vector3.new((math.random()-0.5)*2.0, 0.6 + math.random()*0.8, (math.random()-0.5)*2.0)
+		local b = pos + Vector3.new((math.random()-0.5)*2.0, 0.2 + math.random()*0.6, (math.random()-0.5)*2.0)
+		_spawnBeamZap(a, b, 0.10)
+	end
+end
+
+local function _coinGetPivot(coin: Model): CFrame?
+	if not (coin and coin.Parent) then return nil end
+	local pp = coin.PrimaryPart
+	if not (pp and pp:IsA("BasePart")) then
+		pp = coin:FindFirstChildWhichIsA("BasePart", true)
+		if not pp then return nil end
+		coin.PrimaryPart = pp
+	end
+	return coin:GetPivot()
+end
+local function coinCritImpulse(coin: Model, dirFlat: Vector3)
+	-- Вызовем обычный, но потом ДОБАВИМ сверх-импульс в state
+	coinImpulse(coin, dirFlat, 1.0)
+
+	local st = CoinWobble[coin]
+	if not st then return end
+
+	-- ДВОЙНОЙ “пинок”: сейчас и через 0.045с
+	local function kick(mult: number)
+		st.velPos += (Vector3.new(0, 1.0, 0) + dirFlat * 0.55) * (0.95 * mult)
+		st.velAng += Vector3.new(
+			math.rad(24 * mult),
+			math.rad((math.random()-0.5) * 55 * mult),
+			math.rad((math.random()-0.5) * 40 * mult)
+		)
+		st.tEnd = math.max(st.tEnd, tick() + 0.35)
+	end
+
+	kick(1.0)
+	task.delay(0.045, function()
+		if coin and coin.Parent and CoinWobble[coin] == st then
+			kick(0.65)
+		end
+	end)
+end
+-- [SFX] throttling state
+local _coinSfxState = setmetatable({}, {__mode="k"}) -- [coin] = { lastHitAt=number, breakPlayed=bool }
+local _lastGlobalHitSfxAt = 0
+
+local function _play3DSoundAt(pos: Vector3, soundId: string, volume: number, life: number?, pitchJitter: number?)
+	life = life or 1.5
+	pitchJitter = pitchJitter or 0.12
+
+	local a = Instance.new("Part")
+	a.Anchored = true
+	a.CanCollide = false
+	a.CanQuery = false
+	a.CanTouch = false
+	a.Transparency = 1
+	a.Size = Vector3.new(0.5,0.5,0.5)
+	a.CFrame = CFrame.new(pos)
+	a.Parent = workspace
+
+	local s = Instance.new("Sound")
+	s.SoundId = soundId
+	s.Volume = volume or 0.6
+	s.PlaybackSpeed = 1.0 + ((math.random() - 0.5) * pitchJitter)
+	s.RollOffMinDistance = ROLLOFF_MIN
+	s.RollOffMaxDistance = ROLLOFF_MAX
+	s.Parent = a
+
+	s:Play()
+	Debris:AddItem(a, life)
+end
+
+local function playCoinHitSfxThrottled(coin: Model, pos: Vector3)
+	if not (coin and coin.Parent) then return end
+
+	local now = tick()
+
+	-- глобальный предохранитель
+	if (now - _lastGlobalHitSfxAt) < HIT_SOUND_COOLDOWN_GLOBAL then
+		return
+	end
+
+	local st = _coinSfxState[coin]
+	if not st then
+		st = { lastHitAt = 0, breakPlayed = false }
+		_coinSfxState[coin] = st
+	end
+
+	-- троттлинг на монету
+	if (now - (st.lastHitAt or 0)) < HIT_SOUND_COOLDOWN_PER_COIN then
+		return
+	end
+
+	st.lastHitAt = now
+	_lastGlobalHitSfxAt = now
+
+	local id = HIT_SOUND_IDS[math.random(1, #HIT_SOUND_IDS)]
+	_play3DSoundAt(pos, id, HIT_VOL, 1.2, 0.14)
+end
+
+local function playCoinBreakSfxOnce(coin: Model, pos: Vector3)
+	if not (coin and coin.Parent) then return end
+
+	local st = _coinSfxState[coin]
+	if not st then
+		st = { lastHitAt = 0, breakPlayed = false }
+		_coinSfxState[coin] = st
+	end
+	if st.breakPlayed then return end
+	st.breakPlayed = true
+
+	_play3DSoundAt(pos, BREAK_SOUND_ID, BREAK_VOL, 2.2, 0.06)
+end
+
+coinImpulse = function(coin: Model, dirFlat: Vector3, strength: number?)
+	if not (coin and coin.Parent) then return end
+	local baseCF = _coinGetPivot(coin)
+	if not baseCF then return end
+
+	strength = strength or 1
+	dirFlat = Vector3.new(dirFlat.X, 0, dirFlat.Z)
+	if dirFlat.Magnitude < 1e-3 then dirFlat = Vector3.new(0,0,-1) else dirFlat = dirFlat.Unit end
+	local right = Vector3.new(-dirFlat.Z, 0, dirFlat.X)
+
+	local st = CoinWobble[coin]
+	if not st then
+		st = {
+			baseCF = baseCF,
+			pos = Vector3.zero,
+			ang = Vector3.zero,
+			velPos = Vector3.zero,
+			velAng = Vector3.zero,
+			tEnd = 0,
+			conn = nil,
+		}
+		CoinWobble[coin] = st
+	end
+
+	-- обновим базу (если монету кто-то сдвигал внешне)
+	st.baseCF = baseCF
+
+	-- импульс: немного внутрь + вверх + бок, угол сильнее чем позиция (монета “тяжелая”)
+	st.velPos += (dirFlat * 0.30 + Vector3.new(0, 0.20, 0) + right * ((math.random()-0.5) * 0.15)) * (0.55 * strength)
+	st.velAng += Vector3.new(
+		math.rad(14 * strength),
+		math.rad((math.random()-0.5) * 22 * strength),
+		math.rad((math.random()-0.5) * 18 * strength)
+	)
+
+	-- продлим жизнь wobble
+	st.tEnd = math.max(st.tEnd, tick() + 0.22)
+
+	-- запустим апдейтер один раз
+	if st.conn then return end
+
+	st.conn = RunService.Heartbeat:Connect(function(dt)
+		if not (coin and coin.Parent) then
+			if st.conn then st.conn:Disconnect() end
+			st.conn = nil
+			CoinWobble[coin] = nil
+			return
+		end
+
+		-- если время вышло и колебания почти затухли — стоп
+		if tick() > st.tEnd
+			and st.pos.Magnitude < 0.002
+			and st.ang.Magnitude < math.rad(0.2)
+			and st.velPos.Magnitude < 0.002
+			and st.velAng.Magnitude < math.rad(0.2)
+		then
+			coin:PivotTo(st.baseCF)
+			if st.conn then st.conn:Disconnect() end
+			st.conn = nil
+			-- оставим state (baseCF) чтобы не прыгала при следующем импульсе
+			return
+		end
+
+		-- пружина (жёсткость/демпфирование)
+		local kPos, dPos = 55, 12
+		local kAng, dAng = 85, 16
+
+		st.velPos += (-st.pos * kPos - st.velPos * dPos) * dt
+		st.velAng += (-st.ang * kAng - st.velAng * dAng) * dt
+
+		st.pos += st.velPos * dt
+		st.ang += st.velAng * dt
+
+		-- ограничения, чтобы не улетала
+		st.pos = Vector3.new(
+			math.clamp(st.pos.X, -0.16, 0.16),
+			math.clamp(st.pos.Y, -0.02, 0.12),
+			math.clamp(st.pos.Z, -0.16, 0.16)
+		)
+		st.ang = Vector3.new(
+			math.clamp(st.ang.X, math.rad(-10), math.rad(10)),
+			math.clamp(st.ang.Y, math.rad(-14), math.rad(14)),
+			math.clamp(st.ang.Z, math.rad(-12), math.rad(12))
+		)
+
+		local cf = st.baseCF
+			* CFrame.new(st.pos)
+			* CFrame.Angles(st.ang.X, st.ang.Y, st.ang.Z)
+
+		coin:PivotTo(cf)
+	end)
+end
+
+_spawnImpactBurst = function(pos: Vector3)
+	-- ✅ не каждый удар: меньше каши
+	if math.random() < 0.35 then return end
+
+	local p = Instance.new("Part")
+	p.Anchored = true
+	p.CanCollide = false
+	p.CanQuery = false
+	p.CanTouch = false
+	p.Transparency = 1
+	p.Size = Vector3.new(1,1,1)
+	p.CFrame = CFrame.new(pos)
+	p.Parent = workspace
+
+	local att = Instance.new("Attachment")
+	att.Parent = p
+
+	local em = Instance.new("ParticleEmitter")
+	em.Texture = "rbxassetid://243660364"
+	em.Rate = 0
+	em.Speed = NumberRange.new(6, 11)          -- меньше
+	em.Lifetime = NumberRange.new(0.14, 0.22)  -- короче
+	em.Rotation = NumberRange.new(0, 360)
+	em.RotSpeed = NumberRange.new(-180, 180)
+	em.SpreadAngle = Vector2.new(360, 360)
+	em.Size = NumberSequence.new({
+		NumberSequenceKeypoint.new(0, 0.26),
+		NumberSequenceKeypoint.new(1, 0.0),
+	})
+	em.Parent = att
+
+	em:Emit(math.random(8, 12)) -- ✅ меньше эмит
+
+	Debris:AddItem(p, 0.30)
+end
+
+local function _playImpactSound(at: Vector3)
+	local s = Instance.new("Sound")
+	s.SoundId = "rbxassetid://12222225" -- placeholder “hit/click”; подставь свой
+	s.Volume = 0.6
+	s.PlaybackSpeed = 1.0 + (math.random()-0.5)*0.15
+	s.RollOffMaxDistance = 55
+	s.RollOffMinDistance = 8
+
+	local a = Instance.new("Part")
+	a.Anchored = true
+	a.CanCollide = false
+	a.CanQuery = false
+	a.CanTouch = false
+	a.Transparency = 1
+	a.Size = Vector3.new(1,1,1)
+	a.CFrame = CFrame.new(at)
+	a.Parent = workspace
+
+	s.Parent = a
+	s:Play()
+	Debris:AddItem(a, 1.5)
+end
+
+--========================================================
+-- NEW: Attack profiles (variety without camera)
+--========================================================
+local AttackProfiles = {
+	-- быстрый рывок
+	DASH = {
+		windT = 0.09,
+		recoverT = 0.18,
+		windBack = 1.25,
+		windUp = 0.35,
+		hitUp = 0.95,
+		hitDist = 1.65,
+		side = 0.30,
+		doFlip = false,
+		slam = false,
+		impactStrength = 1.00,
+	},
+
+	-- кувырок (больше экшена)
+	FLIP = {
+		windT = 0.10,
+		recoverT = 0.22,
+		windBack = 1.55,
+		windUp = 0.55,
+		hitUp = 1.40,
+		hitDist = 2.00,
+		side = 0.45,
+		doFlip = true,
+		slam = false,
+		impactStrength = 1.10,
+	},
+
+	-- апперкот (удар снизу вверх)
+	UPPERCUT = {
+		windT = 0.11,
+		recoverT = 0.22,
+		windBack = 1.65,
+		windUp = 0.45,
+		hitUp = 1.85,
+		hitDist = 1.55,
+		side = 0.20,
+		doFlip = false,
+		slam = false,
+		impactStrength = 1.05,
+	},
+
+	-- слэм (удар сверху вниз + мощная отдача монеты)
+	SLAM = {
+		windT = 0.12,
+		recoverT = 0.25,
+		windBack = 1.45,
+		windUp = 1.10,
+		hitUp = 2.55,
+		hitDist = 1.55,
+		side = 0.35,
+		doFlip = false,
+		slam = true,
+		impactStrength = 1.25,
+	},
+}
+
+local function pickAttackProfile(fig: Instance, coin: Model?): string
+	ensureAttackStyle(fig)
+
+	local function antiRepeat(kind: string): string
+		local lastKind = fig:GetAttribute("LastAttackKind")
+		if lastKind == kind and math.random() < 0.65 then
+			return "DASH"
+		end
+		return kind
+	end
+
+	local isCrit = false
+	local kind
+
+	-- крит-слэм (как у тебя) + cooldown на монету
+	local wantCritSlam = (math.random() < CRIT_SLAM_CHANCE)
+	if wantCritSlam then
+		local canSlam = true
+		if coin and coin.Parent then
+			local last = coin:GetAttribute("LastSlamAt")
+			if typeof(last) == "number" and (tick() - last) < CRIT_SLAM_COIN_CD then
+				canSlam = false
+			end
+		end
+		if canSlam then
+			kind = "SLAM"
+			isCrit = true
+			if coin and coin.Parent then
+				coin:SetAttribute("LastSlamAt", tick())
+			end
+		end
+	end
+
+	-- ✅ стиль фигуры влияет на частоту FLIP/UPPERCUT (стабильно)
+	if not kind then
+		local s = getAtkSeed(fig, "AtkStyleSeed", 0.5)  -- 0..1
+		-- базовые вероятности
+		local pFlip = _lerp(0.10, 0.28, s)
+		local pUp   = _lerp(0.10, 0.22, 1 - s)
+		local pDash = math.max(0.40, 1 - (pFlip + pUp))
+
+		local r = math.random()
+		if r < pDash then
+			kind = "DASH"
+		elseif r < pDash + pFlip then
+			kind = "FLIP"
+		else
+			kind = "UPPERCUT"
+		end
+	end
+
+	kind = antiRepeat(kind)
+
+	fig:SetAttribute("LastAttackKind", kind)
+	fig:SetAttribute("LastWasCrit", isCrit)
+	fig:SetAttribute("LastCritMult", isCrit and CRIT_SLAM_MULT or 1.0)
+
+	return kind
+end
+
+local function playAttackHit(attackFig: Instance, coin: Model, onImpact: ((Vector3)->())?, tokenAtStart: number)
+	if not (attackFig and attackFig.Parent) then return end
+	if not (coin and coin.Parent) then return end
+
+	ensureAttackStyle(attackFig)
+
+	-- ✅ токен отмены
+	local function alive(): boolean
+		if not (attackFig and attackFig.Parent) then return false end
+		if tokenAtStart ~= _getAnimToken(attackFig) then return false end
+		return true
+	end
+
+	local standVal = attackFig:FindFirstChild("AttackStandCF")
+	if not (standVal and standVal:IsA("CFrameValue")) then return end
+	local standBefore = standVal.Value
+
+	local ownerHolderOv = attackFig:FindFirstChild("OwnerHolder")
+	local holder = ownerHolderOv and ownerHolderOv:IsA("ObjectValue") and ownerHolderOv.Value
+	if not (holder and holder:IsA("Model")) then holder = nil end
+
+	local function getCoinPrimaryPart(): BasePart?
+		if not (coin and coin.Parent) then return nil end
+		local pp = coin.PrimaryPart
+		if pp and pp:IsA("BasePart") then return pp end
+		pp = coin:FindFirstChildWhichIsA("BasePart", true)
+		if pp and pp:IsA("BasePart") then
+			coin.PrimaryPart = pp
+			return pp
+		end
+		return nil
+	end
+
+	local function coinAlive(): boolean
+		if not (coin and coin.Parent) then return false end
+		local pp = getCoinPrimaryPart()
+		if not pp then return false end
+		local d = coin:FindFirstChild("Durability")
+		if not (d and d:IsA("ValueBase")) then return false end
+		return (tonumber(d.Value) or 0) > 0
+	end
+
+	-- wrap to Model if needed
+	local jumpModel: Model
+	local tmpWrap: Model? = nil
+	if attackFig:IsA("Model") then
+		jumpModel = attackFig
+	elseif attackFig:IsA("BasePart") then
+		local m = Instance.new("Model")
+		m.Name = "_TmpHitModel"
+		attackFig.Parent = m
+		m.PrimaryPart = attackFig
+		m.Parent = workspace
+		jumpModel = m
+		tmpWrap = m
+	else
+		return
+	end
+	ensurePrimary(jumpModel)
+
+	-- ✅ отменяем старые твины
+	cancelModelPivotTween(jumpModel)
+	if not alive() then
+		if tmpWrap and tmpWrap.Parent then tmpWrap:Destroy() end
+		return
+	end
+
+	clampModelToGroundByBBoxForAttack(jumpModel, 0.12, {coin, holder, workspace:FindFirstChild("NFTModels")})
+
+	local pp = getCoinPrimaryPart()
+	if not pp then
+		local tw = tweenModelPivot(jumpModel, standBefore, 0.18, Enum.EasingStyle.Quad, Enum.EasingDirection.Out)
+		if tw then pcall(function() tw.Completed:Wait() end) end
+		standVal.Value = standBefore
+		if tmpWrap and tmpWrap.Parent then tmpWrap:Destroy() end
+		return
+	end
+	if not alive() then
+		if tmpWrap and tmpWrap.Parent then tmpWrap:Destroy() end
+		return
+	end
+
+	-- ===========================
+	-- ✅ STYLE: seeds / biases
+	-- ===========================
+	local tempoSeed = getAtkSeed(attackFig, "AtkTempoSeed", 0.5)
+	local rangeSeed = getAtkSeed(attackFig, "AtkRangeSeed", 0.5)
+	local upSeed    = getAtkSeed(attackFig, "AtkUpSeed", 0.5)
+	local sideSeed  = getAtkSeed(attackFig, "AtkSideSeed", 0.5)
+	local sideSign  = attackFig:GetAttribute("AtkSideSign")
+	if typeof(sideSign) ~= "number" then sideSign = 1 end
+	sideSign = (sideSign >= 0) and 1 or -1
+
+	-- стабильные множители
+	local tempoMult = _lerp(0.85, 1.18, tempoSeed)         -- скорость (тайминги)
+	local approachBase = _lerp(0.70, 1.75, rangeSeed)      -- насколько близко влетать к монете
+	local hitUpBias = _lerp(-0.25, 0.45, upSeed)           -- выше/ниже
+	local sideBias = _lerp(0.75, 1.25, sideSeed)           -- ширина ухода вбок
+
+	-- небольшой шум на удар (НЕ стабильный)
+	local tempoJit   = 1.0 + _signedNoise(0.06)
+	local approachJ  = _signedNoise(0.22)                  -- метры
+	local hitUpJ     = _signedNoise(0.18)                  -- метры
+	local sideJ      = _signedNoise(0.10)                  -- метры
+
+	local kind = pickAttackProfile(attackFig, coin)
+	local prof = AttackProfiles[kind] or AttackProfiles.DASH
+
+	-- крит усиливаем, как у тебя, но тоже “в стиле”
+	local isCrit = (attackFig:GetAttribute("LastWasCrit") == true)
+	if isCrit then
+		prof = table.clone(prof)
+		prof.impactStrength = (prof.impactStrength or 1.0) * 1.7
+		prof.hitUp = (prof.hitUp or 1.0) + 0.35
+		prof.windUp = (prof.windUp or 0.5) + 0.25
+	end
+
+	-- ===========================
+	-- геометрия удара
+	-- ===========================
+	local coinPos = pp.Position
+	local p0 = jumpModel:GetPivot().Position
+
+	local dir = coinPos - p0
+	dir = Vector3.new(dir.X, 0, dir.Z)
+	if dir.Magnitude < 0.05 then
+		local tw = tweenModelPivot(jumpModel, standBefore, 0.18, Enum.EasingStyle.Quad, Enum.EasingDirection.Out)
+		if tw then pcall(function() tw.Completed:Wait() end) end
+		standVal.Value = standBefore
+		if tmpWrap and tmpWrap.Parent then tmpWrap:Destroy() end
+		return
+	end
+	dir = dir.Unit
+	local right = Vector3.new(-dir.Z, 0, dir.X)
+
+	-- ✅ side: стабильная сторона + “характер” + мелкий шум
+	local side = sideSign * ((prof.side or 0.35) * sideBias + sideJ)
+
+	-- ✅ тайминги: зависят от tempoMult
+	local windT    = (prof.windT or 0.10)    * tempoMult * tempoJit
+	local recoverT = (prof.recoverT or 0.22) * tempoMult * tempoJit
+
+	-- ✅ windBack / windUp: тоже чуть плавают (стабильно + шум)
+	local windBack = (prof.windBack or 1.6) * _lerp(0.90, 1.25, rangeSeed) * (1.0 + _signedNoise(0.04))
+	local windUp   = (prof.windUp   or 0.55) + _lerp(-0.10, 0.25, upSeed) + _signedNoise(0.08)
+
+	-- ✅ hitUp: важная вариативность высоты удара
+	local hitUp    = (prof.hitUp    or 1.35) + hitUpBias + hitUpJ
+
+	-- ✅ КЛЮЧ: рандомизируем approachDist (а не держим константу)
+	local distToCoin = (Vector3.new(coinPos.X, 0, coinPos.Z) - Vector3.new(p0.X, 0, p0.Z)).Magnitude
+	local approach = approachBase + approachJ
+	approach = math.clamp(approach, 0.55, 2.10)
+
+	-- hitDist: “долететь почти до монеты” +/- микрошум
+	local micro = _signedNoise(0.18)
+	local hitDist = math.max(0.85, distToCoin - approach + micro)
+
+	local hitPos = p0 + dir * hitDist + Vector3.new(0, hitUp, 0) + right * side
+	hitPos = clampPosToGroundForAttack(hitPos, 0.12, {coin, jumpModel})
+
+	local hitCF = CFrame.lookAt(hitPos, Vector3.new(coinPos.X, hitPos.Y, coinPos.Z), Vector3.yAxis)
+	if holder then hitCF = applyFaceYaw(hitCF, getFigureFaceYawDeg(holder)) end
+
+	local trailPack = _makeTempTrail(jumpModel)
+
+	-- ===========================
+	-- 1) WINDUP
+	-- ===========================
+	do
+		local backPos = p0 - dir * windBack + Vector3.new(0, windUp, 0)
+		backPos = clampPosToGroundForAttack(backPos, 0.12, {coin, jumpModel})
+
+		local windCF = CFrame.lookAt(backPos, Vector3.new(coinPos.X, backPos.Y, coinPos.Z), Vector3.yAxis)
+		if holder then windCF = applyFaceYaw(windCF, getFigureFaceYawDeg(holder)) end
+
+		local twW = tweenModelPivot(jumpModel, windCF, windT, Enum.EasingStyle.Quad, Enum.EasingDirection.Out)
+		if twW then pcall(function() twW.Completed:Wait() end) end
+		if not alive() then
+			if trailPack then pcall(function() trailPack.trail.Enabled=false end) end
+			if tmpWrap and tmpWrap.Parent then tmpWrap:Destroy() end
+			return
+		end
+	end
+
+	-- ===========================
+	-- 2) APPROACH
+	-- ===========================
+	_afterImageBurst(jumpModel)
+	do
+		local fromCF = jumpModel:GetPivot()
+		pcall(function()
+			_spawnBeamZap(fromCF.Position + Vector3.new(0, 0.6, 0), hitCF.Position + Vector3.new(0, 0.6, 0), 0.10)
+		end)
+
+		if prof.slam then
+			local high = fromCF * CFrame.new(0, 2.6 + _lerp(0.0, 0.8, upSeed), 0)
+			arcJump(jumpModel, fromCF, high)
+			if not alive() then
+				if tmpWrap and tmpWrap.Parent then tmpWrap:Destroy() end
+				return
+			end
+			arcJump(jumpModel, high, hitCF)
+		else
+			if prof.doFlip then
+				arcJumpSpin(jumpModel, fromCF, hitCF, 1.15 + _lerp(0.0, 0.55, sideSeed))
+			else
+				arcJump(jumpModel, fromCF, hitCF)
+			end
+		end
+		if not alive() then
+			if tmpWrap and tmpWrap.Parent then tmpWrap:Destroy() end
+			return
+		end
+	end
+
+	-- hitstop
+	pcall(function() _hitStopModel(jumpModel, 0.05) end)
+	if not alive() then
+		if tmpWrap and tmpWrap.Parent then tmpWrap:Destroy() end
+		return
+	end
+
+	-- overshoot: тоже чуть зависит от стиля
+	do
+		local overZ = -_lerp(0.22, 0.38, rangeSeed)
+		local overPitch = math.rad(_lerp(-7, -13, upSeed))
+		local over = hitCF * CFrame.new(0, 0, overZ) * CFrame.Angles(overPitch, 0, 0)
+
+		local twO = tweenModelPivot(jumpModel, over, 0.06 * tempoMult, Enum.EasingStyle.Quad, Enum.EasingDirection.Out)
+		if twO then pcall(function() twO.Completed:Wait() end) end
+		if not alive() then
+			if tmpWrap and tmpWrap.Parent then tmpWrap:Destroy() end
+			return
+		end
+
+		task.wait(0.03)
+		if not alive() then
+			if tmpWrap and tmpWrap.Parent then tmpWrap:Destroy() end
+			return
+		end
+
+		local twB = tweenModelPivot(jumpModel, hitCF, 0.07 * tempoMult, Enum.EasingStyle.Quad, Enum.EasingDirection.In)
+		if twB then pcall(function() twB.Completed:Wait() end) end
+		if not alive() then
+			if tmpWrap and tmpWrap.Parent then tmpWrap:Destroy() end
+			return
+		end
+	end
+
+	-- ===========================
+	-- IMPACT
+	-- ===========================
+	do
+		local pp2 = getCoinPrimaryPart()
+		if pp2 then coinPos = pp2.Position end
+		local impactPos = coinPos + Vector3.new(0, 0.7, 0)
+
+		if onImpact then pcall(function() onImpact(impactPos) end) end
+		if not alive() then
+			if tmpWrap and tmpWrap.Parent then tmpWrap:Destroy() end
+			return
+		end
+
+		if coin and coin.Parent and getCoinPrimaryPart() then
+			local wasCrit = (attackFig:GetAttribute("LastWasCrit") == true)
+			if wasCrit then
+				pcall(function() _hitStopModel(jumpModel, 0.10) end)
+				pcall(function() _hitStopPart(getCoinPrimaryPart(), 0.08) end)
+				pcall(function() coinCritImpulse(coin, dir) end)
+				pcall(function() _spawnCritFX(impactPos, coin, jumpModel) end)
+				pcall(function()
+					spawnFallingTextAt(impactPos, "CRIT!", Color3.fromRGB(255, 220, 60), 0.95)
+				end)
+			else
+				local strength = (prof.impactStrength or 1.0) * _lerp(0.92, 1.12, rangeSeed)
+				pcall(function() coinImpulse(coin, dir, strength) end)
+				pcall(function() _spawnHitFlash(impactPos) end)
+				pcall(function() _spawnGlitchBits(impactPos) end)
+				pcall(function() _spawnImpactBurst(impactPos) end)
+			end
+			pcall(function() playCoinHitSfxThrottled(coin, impactPos) end)
+
+		end
+	end
+
+	if not alive() then
+		if tmpWrap and tmpWrap.Parent then tmpWrap:Destroy() end
+		return
+	end
+
+	-- ===========================
+	-- 3) RECOVER
+	-- ===========================
+	local slotIndex = (attackFig:GetAttribute("SlotIndex") or 1)
+	local n = (attackFig:GetAttribute("SlotCount") or 1)
+
+	local newStand = standBefore
+	if coinAlive() then
+		local cf = computeCombatStandCF(coin, holder, slotIndex, n, (jumpModel:IsA("Model") and jumpModel or nil))
+		if cf then newStand = cf end
+	end
+
+	local twC = tweenModelPivot(jumpModel, newStand, recoverT, Enum.EasingStyle.Quad, Enum.EasingDirection.Out)
+	if twC then pcall(function() twC.Completed:Wait() end) end
+	if not alive() then
+		if tmpWrap and tmpWrap.Parent then tmpWrap:Destroy() end
+		return
+	end
+
+	standVal.Value = newStand
+
+	if trailPack then
+		pcall(function() trailPack.trail.Enabled = false end)
+		Debris:AddItem(trailPack.trail, 0.25)
+		Debris:AddItem(trailPack.a0, 0.25)
+		Debris:AddItem(trailPack.a1, 0.25)
+	end
+
+	if tmpWrap and tmpWrap.Parent then
+		tmpWrap:Destroy()
+	end
+end
+
+
+local _lastHitAnim = setmetatable({}, {__mode="k"})
+
+local function playAttackHitSafe(fig, coin, onImpact)
+	local ready = fig and fig:FindFirstChild("AttackReady")
+	if ready and ready:IsA("BoolValue") and ready.Value == false then
+		return
+	end
+
+	local now = tick()
+	local last = _lastHitAnim[fig] or 0
+	if last + 0.35 > now then return end
+	_lastHitAnim[fig] = now
+
+	-- ✅ захватываем токен на старте
+	local token = _getAnimToken(fig)
+
+	playAttackHit(fig, coin, onImpact, token)
+end
+
+spawnFallingTextAt = function(position, text, color, yOffset)
+	if not position or not text then return end
+	local offset = yOffset or 0
+	local anchor = Instance.new("Part")
+	anchor.Anchored, anchor.CanCollide, anchor.Transparency = true, false, 1
+	anchor.Size = Vector3.new(1,1,1)
+	anchor.CFrame = CFrame.new(position + Vector3.new(0, 3 + offset, 0))
+	anchor.Parent = workspace
+
+	local bb = Instance.new("BillboardGui")
+	bb.Size = UDim2.new(0, 200, 0, 60)
+	bb.AlwaysOnTop = true
+	bb.LightInfluence = 0
+	bb.Adornee = anchor
+	bb.Parent = anchor
+
+	local lbl = Instance.new("TextLabel")
+	lbl.Size = UDim2.new(1, 0, 1, 0)
+	lbl.BackgroundTransparency = 1
+	lbl.Text = text
+	lbl.TextColor3 = color or Color3.new(1,1,1)
+	lbl.TextScaled = true
+	lbl.TextWrapped = true
+	lbl.Font = Enum.Font.SciFi
+	lbl.Parent = bb
+	lbl.TextTransparency = 0
+	lbl.TextStrokeTransparency = 0.15
+	lbl.Rotation = (math.random()-0.5) * 8
+
+	local UiStroke = Instance.new("UIStroke")
+	UiStroke.Thickness = 2
+	UiStroke.Color = Color3.new(0,0,0)
+	UiStroke.Parent = lbl
+
+	TweenService:Create(anchor, TweenInfo.new(1.0, Enum.EasingStyle.Quad, Enum.EasingDirection.Out), {
+		CFrame = anchor.CFrame * CFrame.new(0, 4.5, 0)
+	}):Play()
+
+	task.delay(1.6, function() if anchor and anchor.Parent then anchor:Destroy() end end)
+end
+local _coinHintState = setmetatable({}, {__mode="k"}) -- [coin] = {tLast=number, burstLeft=number}
+
+--========================================================
+-- NEW: apply damage exactly at impact moment (per figure)
+--========================================================
+local function applyOneHitDamage(player: Player, coin: Model, state, holder: Model, dmg: number)
+	if not (player and coin and coin.Parent and coin.PrimaryPart) then return false end
+	if not (state and ActiveAttacks[coin] == state and state.owner == player) then return false end
+	if not coin:FindFirstChild("Durability") then return false end
+	if dmg <= 0 then return true end
+
+	local durBefore = coin.Durability.Value
+	if durBefore <= 0 then return false end
+
+	-- clamp overkill
+	local effective = math.min(dmg, durBefore)
+	coin.Durability.Value = durBefore - effective
+
+	-- stats
+	state.damageByNft = state.damageByNft or {}
+	state.damageByNft[holder] = (state.damageByNft[holder] or 0) + effective
+
+	-- stream payout for this one hit
+	local effMap = {}
+	effMap[holder] = effective
+	StreamedRewards.ProcessTick(player, coin, effMap)
+
+	-- =====================================================
+	-- ✅ FIX: falling hint text throttling (no spam)
+	-- =====================================================
+	do
+		local pp = coin.PrimaryPart
+		if pp then
+			local now = tick()
+			local st = _coinHintState[coin]
+
+			if not st then
+				st = { tLast = 0, burstLeft = 0 }
+				_coinHintState[coin] = st
+			end
+
+			-- Базовый кулдаун между любыми подсказками на монете
+			local COOLDOWN = 0.55
+
+			-- Шанс показать подсказку на обычный удар
+			local CHANCE = 0.30
+
+			-- Иногда делаем маленький “бурст” из 2 подсказок, но тоже под контролем
+			local BURST_CHANCE = 0.08
+			local BURST_SIZE = 2
+
+			local canShow = (now - (st.tLast or 0)) >= COOLDOWN
+
+			if canShow then
+				local show = (math.random() < CHANCE) or (st.burstLeft and st.burstLeft > 0)
+
+				if show then
+					st.tLast = now
+
+					-- если бурст активен — уменьшаем
+					if st.burstLeft and st.burstLeft > 0 then
+						st.burstLeft -= 1
+					else
+						-- иногда запускаем бурст
+						if math.random() < BURST_CHANCE then
+							st.burstLeft = BURST_SIZE - 1
+						end
+					end
+
+					pcall(function()
+						spawnFallingTextAt(
+							pp.Position,
+							randomSeedHint(),
+							Color3.fromRGB(120, 255, 170),
+							0.2
+						)
+					end)
+				end
+			end
+		end
+	end
+
+	-- killed?
+	if coin.Durability.Value <= 0 then
+		local pp = coin.PrimaryPart or coin:FindFirstChildWhichIsA("BasePart", true)
+		if pp then
+			pcall(function()
+				playCoinBreakSfxOnce(coin, pp.Position)
+			end)
+		end
+
+		-- можно почистить хинт-state, чтобы не держать ссылку
+		_coinHintState[coin] = nil
+
+		if coin.PrimaryPart then
+			pcall(function()
+				spawnFallingTextAt(coin.PrimaryPart.Position, "Success", Color3.new(0,1,0), 0)
+			end)
+		end
+
+		-- stop coin FX
+		if state.fxToken then
+			pcall(function() HackFX.StopCoinFX(coin, state.fxToken, {shatter=true}) end)
+		end
+
+		-- stop loops + return all
+		if state.attackLoops then
+			for h,_ in pairs(state.attackLoops) do
+				state.attackLoops[h] = nil
+			end
+		end
+
+		for _, nft in ipairs(state.attackers or {}) do
+			stopAttackerVisuals(player, state, nft)
+			NFTBusy[nft] = false
+			NFTTarget[nft] = nil
+		end
+
+		local coinRef = coin
+		task.delay(1.2, function()
+			if coinRef and coinRef.Parent then
+				ClearCircleEvent:FireAllClients(coinRef)
+				pcall(function() StreamedRewards.Flush(player, coinRef) end)
+				coinRef:Destroy()
+			end
+		end)
+
+		ActiveAttacks[coin] = nil
+	end
+
+	return true
+end
+
+
+--========================================================
+-- UPDATED: per-holder attack loop (safe anim call)
+--========================================================
+local function startPerNftAttackLoop(player: Player, coin: Model, state, holder: Model)
+	if not (player and coin and state and holder) then return end
+
+	state.attackLoops = state.attackLoops or {}
+	if state.attackLoops[holder] then return end
+	state.attackLoops[holder] = true
+
+	-- базовый интервал (в среднем)
+	local BASE = 0.78
+	local JIT  = 0.22
+
+	-- helper: достать фигуру (attack-figure) и seed
+	local function getFigAndSeeds()
+		local fig = state.attackFigures and state.attackFigures[holder]
+		if not (fig and fig.Parent) then return nil end
+
+		-- темп конкретной фигуры (0..1)
+		local tempoSeed = fig:GetAttribute("AtkTempoSeed")
+		if typeof(tempoSeed) ~= "number" then tempoSeed = math.random() end
+
+		-- стабильная фаза (0..1), чтобы они НЕ начинали одновременно
+		local phase = fig:GetAttribute("AtkPhase")
+		if typeof(phase) ~= "number" then
+			phase = math.random()
+			fig:SetAttribute("AtkPhase", phase)
+		end
+
+		return fig, tempoSeed, phase
+	end
+
+	task.spawn(function()
+		-- ждём пока фигура реально готова
+		local fig, tempoSeed, phase
+		for _ = 1, 80 do -- ~6-7 сек максимум ожидания
+			if not (state.attackLoops and state.attackLoops[holder]) then return end
+			if not (coin and coin.Parent and coin:FindFirstChild("Durability")) then return end
+			if not ActiveAttacks[coin] or ActiveAttacks[coin] ~= state then return end
+			if state.owner ~= player then return end
+			if not (holder and holder.Parent) then return end
+
+			fig, tempoSeed, phase = getFigAndSeeds()
+			if fig then
+				local ready = fig:FindFirstChild("AttackReady")
+				if not ready or (ready:IsA("BoolValue") and ready.Value == true) then
+					break
+				end
+			end
+			task.wait(0.08)
+		end
+
+		fig, tempoSeed, phase = getFigAndSeeds()
+		if not fig then
+			state.attackLoops[holder] = nil
+			return
+		end
+
+		-- ✅ СТАБИЛЬНЫЙ темп для этой фигуры:
+		-- tempoSeed=0 -> чуть медленнее, tempoSeed=1 -> быстрее
+		local tempoMult = 1.12 - (tempoSeed * 0.28)  -- диапазон примерно 1.12..0.84
+
+		-- ✅ СТАБИЛЬНАЯ фаза: разносит старт по времени
+		local initialDelay = 0.25 + phase * (BASE * 1.15)
+		task.wait(initialDelay)
+
+		-- ✅ отдельный “личный” таймер, чтобы без пачек
+		local nextAt = tick()
+
+		while state.attackLoops and state.attackLoops[holder] do
+			if not (coin and coin.Parent and coin:FindFirstChild("Durability")) then break end
+			if not ActiveAttacks[coin] or ActiveAttacks[coin] ~= state then break end
+			if state.owner ~= player then break end
+			if not (holder and holder.Parent) then break end
+			if coin.Durability.Value <= 0 then break end
+
+			-- актуальная фигура (может пересоздаться)
+			local figNow = state.attackFigures and state.attackFigures[holder]
+			if not (figNow and figNow.Parent) then
+				task.wait(0.08)
+				continue
+			end
+
+			local ready = figNow:FindFirstChild("AttackReady")
+			if ready and ready:IsA("BoolValue") and ready.Value == false then
+				task.wait(0.08)
+				continue
+			end
+
+			-- если мы пришли раньше планового nextAt — ждём
+			local now = tick()
+			if now < nextAt then
+				task.wait(math.min(0.12, nextAt - now))
+				continue
+			end
+
+			-- dmg
+			local dmg = 0
+			if holder:FindFirstChild("Power") then
+				dmg = tonumber(holder.Power.Value) or 0
+			end
+			if dmg > 0 and hasActiveBoost(player, "2xPowerBoost") then
+				dmg = dmg * 2
+			end
+
+			-- SAFE: не даём перекрываться
+			playAttackHitSafe(figNow, coin, function(_impactPos)
+				if not (coin and coin.Parent and coin:FindFirstChild("Durability")) then return end
+				if coin.Durability.Value <= 0 then return end
+
+				local mult = tonumber(figNow:GetAttribute("LastCritMult")) or 1.0
+				applyOneHitDamage(player, coin, state, holder, dmg * mult)
+			end)
+
+			-- ✅ следующее время удара: личный интервал с темпом + небольшой jitter
+			local interval = (BASE * tempoMult) + (math.random() * JIT)
+			-- лёгкая защита от “схождения фаз” со временем
+			interval = interval + (math.random() * 0.08)
+			nextAt = now + interval
+		end
+
+		if state.attackLoops then
+			state.attackLoops[holder] = nil
+		end
+	end)
+end
+
+
+local function weldHolderToPrimary(holder: Model)
+	if not holder.PrimaryPart then return end
+
+	local fig = holder:FindFirstChild("Figure") -- Model/Part
+	for _, d in ipairs(holder:GetDescendants()) do
+		if d:IsA("BasePart") and d ~= holder.PrimaryPart then
+			-- ВАЖНО: не трогаем части 3D-фигуры
+			if fig and d:IsDescendantOf(fig) then
+				continue
+			end
+
+			d.Anchored = false
+			d.CanCollide = false
+			d.CanQuery = false
+			d.CanTouch = false
+
+			if not d:FindFirstChild("WeldToPrimary") then
+				local w = Instance.new("WeldConstraint")
+				w.Name = "WeldToPrimary"
+				w.Part0 = holder.PrimaryPart
+				w.Part1 = d
+				w.Parent = d
+			end
+		end
+	end
+end
+
+--========================================================
+-- Equip slots / Upgrades
+--========================================================
+local function getEquipUpgradeValue(player)
+	local PlayerData = ServerStorage:FindFirstChild(player.UserId .. "_Data")
+	if not PlayerData then return nil end
+	local PlayerUpgrades = PlayerData:FindFirstChild("PlayerUpgrades")
+	if not PlayerUpgrades then return nil end
+	local v = PlayerUpgrades:FindFirstChild("PlayerEquipmentUpgradeLvl")
+	if v and v:IsA("IntValue") then return v.Value end
+	return nil
+end
+
+local function getMaxEquipped(player)
+	local baseSlots = 5
+	local lvl = getEquipUpgradeValue(player)
+	return baseSlots + (lvl or 0)
+end
+
+--========================================================
+-- Visual follow / formation
+--========================================================
+local function moveNFTInFormation(player, nftModel, index, alpha, t)
+	if not (nftModel and nftModel.Parent) then return end
+
+	-- ✅ не двигаем, пока идёт реаттач
+	if nftModel:GetAttribute("_ReattachLock") == true then return end
+
+	if NFTBusy[nftModel] then return end
+	if DetachedFigureState[nftModel] then return end
+	if nftModel:GetAttribute("_NeedReattach") == true then return end
+
+	if not nftModel.PrimaryPart then
+		local p = nftModel:FindFirstChildWhichIsA("BasePart")
+		if p then nftModel.PrimaryPart = p else return end
+	end
+	
+	local targetCF = computeHolderTargetCF(player, index, t)
+	if not targetCF then return end
+
+	targetCF = clampHolderToGroundByBottom(
+		targetCF,
+		nftModel,
+		0.06,
+		{ player.Character, workspace:FindFirstChild("NFTModels") }
+	)
+
+
+	local currentCF = nftModel:GetPivot()
+	local dist = (currentCF.Position - targetCF.Position).Magnitude
+	if dist > SNAP_DISTANCE_FOLLOW then
+		nftModel:PivotTo(targetCF)
+		return
+	end
+
+	nftModel:PivotTo(currentCF:Lerp(targetCF, alpha))
+end
+
+
+RunService.Heartbeat:Connect(function(dt)
+	local alpha = 1 - math.pow(1 - lerpSpeed, dt * 60)
+	local t = tick()
+	for player, list in pairs(EquippedNFTs) do
+		for i, nft in ipairs(list) do
+			moveNFTInFormation(player, nft, i, alpha, t)
+		end
+	end
+end)
+
+--========================================================
+-- UI текст «крипто-ошибки» (мелкий фидбек)
+--========================================================
+local function cleanupAttackerOnState(player, coin, state, nft)
+	if not state or not nft then return end
+
+	for i = #state.attackers, 1, -1 do
+		if state.attackers[i] == nft then
+			table.remove(state.attackers, i)
+			break
+		end
+	end
+
+	-- ✅ stop per-nft loop
+	if state.attackLoops then
+		state.attackLoops[nft] = nil
+	end
+
+	-- FX detach
+	if state.fxToken then
+		pcall(function() HackFX.DetachNft(nft, state.fxToken) end)
+	end
+
+	if state.keyboards and state.keyboards[nft] then
+		if state.keyboards[nft].Parent then state.keyboards[nft]:Destroy() end
+		state.keyboards[nft] = nil
+	end
+	if state.typingConns and state.typingConns[nft] then
+		state.typingConns[nft] = nil
+	end
+	if state.damageByNft then
+		state.damageByNft[nft] = nil
+	end
+
+	-- ✅ ВАЖНО: пока возвращаем визуал — busy держим TRUE, чтобы follow не дёргал холдер
+	NFTBusy[nft] = true
+	stopAttackerVisuals(player, state, nft)
+
+	-- ✅ только теперь отпускаем
+	NFTBusy[nft] = false
+	NFTTarget[nft] = nil
+end
+
+
+local function tryStopAttackIfEmpty(coin, state)
+	if not state or not coin then return false end
+	if #state.attackers == 0 then
+		-- stop per-nft loops
+		if state.attackLoops then
+			for h,_ in pairs(state.attackLoops) do
+				state.attackLoops[h] = nil
+			end
+		end
+
+		if state.connection then state.connection:Disconnect() end
+		if coin.Parent then
+			ClearCircleEvent:FireAllClients(coin)
+		end
+		if state.fxToken then
+			pcall(function() HackFX.StopCoinFX(coin, state.fxToken, {shatter=false}) end)
+		end
+		ActiveAttacks[coin] = nil
+		return true
+	end
+	return false
+end
+
+
+local function removeNFTFromAllAttacks(player, nft)
+	for coin, st in pairs(ActiveAttacks) do
+		if st.owner == player then
+			cleanupAttackerOnState(player, coin, st, nft)
+			tryStopAttackIfEmpty(coin, st)
+		end
+	end
+end
+
+local function removeAllPlayerNFTsFromAttacks(player)
+	for coin, st in pairs(ActiveAttacks) do
+		if st.owner == player then
+			for i = #st.attackers, 1, -1 do
+				local nft = st.attackers[i]
+				cleanupAttackerOnState(player, coin, st, nft)
+			end
+			tryStopAttackIfEmpty(coin, st)
+		end
+	end
+end
+
+--========================================================
+-- Единая функция снятия по uuid
+--========================================================
+local function unequipByUuidServer(player: Player, uuid:string)
+	local list = EquippedNFTs[player]
+	if not list then return end
+	local idx, mdl
+	for i, m in ipairs(list) do
+		if m and m.Name == uuid then idx, mdl = i, m break end
+	end
+	if not mdl then return end
+
+	removeNFTFromAllAttacks(player, mdl)
+
+	if mdl.PrimaryPart then
+		local upCF = mdl.PrimaryPart.CFrame + Vector3.new(0, 15, 0)
+		local tw = TweenInfo.new(0.8, Enum.EasingStyle.Quad, Enum.EasingDirection.In)
+		tweenPivot(mdl, mdl:GetPivot() + Vector3.new(0, 15, 0), 0.8, Enum.EasingStyle.Quad, Enum.EasingDirection.In)
+
+		task.delay(tw.Time + 0.05, function() if mdl and mdl.Parent then mdl:Destroy() end end)
+	else
+		mdl:Destroy()
+	end
+	table.remove(list, idx)
+	saveEquippedDebounced(player)
+end
+
+--========================================================
+-- Спавн модели (с установкой CoinMultiplier/Background)
+--========================================================
+--========================================================
+-- Спавн модели (FIGURE HOLDER + 3D model)
+--========================================================
+local function spawnEquippedModel(player: Player, uuid: string): boolean
+	uuid = tostring(uuid)
+	if uuid == "" then return false end
+
+	EquippedNFTs[player] = EquippedNFTs[player] or {}
+
+	local _, already = findEquippedModelByUuid(player, uuid)
+	if already then return false end
+
+	local PlayerInventory = ServerStorage:FindFirstChild(player.UserId .. "_Data")
+	if not PlayerInventory then return false end
+	local NftsFolder = PlayerInventory:FindFirstChild("NFT")
+	if not NftsFolder then return false end
+	local nft = NftsFolder:FindFirstChild(uuid)
+	if not nft then return false end
+
+	local info = {
+		Crust      = nft:GetAttribute("Crust"),
+		Background = nft:GetAttribute("Background"),
+		Nft        = nft:GetAttribute("Name"),
+		Power      = nft:GetAttribute("Power"),
+	}
+
+	local maxEquipped = getMaxEquipped(player)
+	if #EquippedNFTs[player] >= maxEquipped then return false end
+
+	local nftRoot = workspace:FindFirstChild("NFTModels")
+	if not nftRoot then
+		nftRoot = Instance.new("Folder")
+		nftRoot.Name = "NFTModels"
+		nftRoot.Parent = workspace
+	end
+
+	-- === 1) клоним холдер
+	local holder = FigureHolderTemplate:Clone()
+	holder.Name = uuid
+	holder.Parent = nftRoot
+	holder:SetAttribute("GroundOffsetY", -1.75)
+
+	holder:SetAttribute("Background", info.Background)
+	holder:SetAttribute("CoinMultiplier", getBgMultiplier(info.Background))
+	holder:SetAttribute("Nft", tostring(info.Nft))
+	holder:SetAttribute("NftKey", normalizeNftKey(tostring(info.Nft)))
+
+	local ownerSv = Instance.new("StringValue")
+	ownerSv.Name = "NftOwner"
+	ownerSv.Value = tostring(player.UserId)
+	ownerSv.Parent = holder
+
+	-- === 2) power
+	local pVal = holder:FindFirstChild("Power", true)
+	if pVal and pVal:IsA("ValueBase") then
+		pVal.Value = info.Power
+	end
+
+	-- === 3) ставим фон на BackgroundPart/Texture (Decal)
+	local bgId = GetRbxAssetId.getRbxAssetId(info.Background)
+	do
+		local bgPart = holder:FindFirstChild("BackgroundPart", true)
+		if bgPart and bgPart:IsA("BasePart") then
+			local decal = bgPart:FindFirstChildWhichIsA("Decal")
+			if decal then
+				decal.Texture = bgId
+			else
+				-- если у тебя вместо Decal другой объект (SurfaceGui) — тут подправишь
+				local tex = bgPart:FindFirstChild("Texture", true)
+				if tex and tex:IsA("Decal") then
+					tex.Texture = bgId
+				end
+			end
+		end
+	end
+
+	-- === 4) ставим визуальную корку по атрибуту NFT (Crust)
+	--     ВАЖНО: сначала определим временный PrimaryPart (mount), потом уже корку сделаем primary.
+	do
+		local mount = holder:FindFirstChild("NftFigureMount", true)
+		if mount and mount:IsA("BasePart") then
+			holder.PrimaryPart = mount
+		end
+	end
+
+	applyCrustToHolder(holder, info.Crust)
+
+
+	-- теперь PrimaryPart делаем корку (если она есть)
+	do
+
+
+		-- если по какой-то причине primary так и не выставлен — fallback:
+		if not holder.PrimaryPart then
+			local frame = holder:FindFirstChild("CrustFrame", true) or holder:FindFirstChild("Crust", true)
+			if frame and frame:IsA("BasePart") then
+				holder.PrimaryPart = frame
+			else
+				local mount = holder:FindFirstChild("NftFigureMount", true)
+				if mount and mount:IsA("BasePart") then
+					holder.PrimaryPart = mount
+				end
+			end
+		end
+	end
+
+	if not holder.PrimaryPart then
+		warn("FigureHolder has no PrimaryPart (crust/frame/mount missing)")
+		holder:Destroy()
+		return false
+	end
+
+	-- ✅ обязательно: приварить всё кроме Figure к PrimaryPart
+	weldHolderToPrimary(holder)
+
+	-- === 5) прикрепляем 3D фигуру по имени NFT
+	local fig = attachFigureToHolder(holder, tostring(info.Nft))
+	if not fig then
+		warn("No figure model for:", tostring(info.Nft))
+		-- можно оставить холдер пустым или удалить:
+		holder:Destroy()
+		return false
+	end
+
+	-- === 6) регистрируем
+	table.insert(EquippedNFTs[player], holder)
+
+	-- === 7) стартовая анимация входа в формацию
+	-- === 7) стартовая анимация входа в формацию (используем ту же логику, что и follow)
+	local hrp = player.Character and player.Character:FindFirstChild("HumanoidRootPart")
+	if hrp then
+		local index = #EquippedNFTs[player]
+		local targetCF = computeHolderTargetCF(player, index, tick())
+		if targetCF then
+
+			local startCF = targetCF + Vector3.new(0, 15, 0)
+			holder:PivotTo(startCF)
+			tweenPivot(holder, targetCF, 1.0, Enum.EasingStyle.Quad, Enum.EasingDirection.Out)
+		end
+
+	end
+
+
+
+	return true
+end
+
+
+--========================================================
+-- Equip / Unequip / UnequipAll
+--========================================================
+local function equipByUuidInternal(player, uuid)
+	if spawnEquippedModel(player, tostring(uuid)) then
+		saveEquippedDebounced(player)
+		return true
+	end
+	return false
+end
+
+EquipNftEvent.OnServerEvent:Connect(function(player, uuid)
+	equipByUuidInternal(player, uuid)
+end)
+
+EquipNftServer.Event:Connect(function(player, uuid)
+	equipByUuidInternal(player, uuid)
+end)
+
+
+UnequipNftEvent.OnServerEvent:Connect(function(player, uuid)
+	unequipByUuidServer(player, tostring(uuid))
+end)
+
+ForceUnequipNFT.Event:Connect(function(player, uuid)
+	unequipByUuidServer(player, tostring(uuid))
+end)
+
+if UnequipAllEvent then
+	UnequipAllEvent.OnServerEvent:Connect(function(player)
+		removeAllPlayerNFTsFromAttacks(player)
+		local list = EquippedNFTs[player]
+		if not list then return end
+		for i = #list, 1, -1 do
+			local m = list[i]
+			if m and m.Parent then
+				if m.PrimaryPart then
+					local upCF = m.PrimaryPart.CFrame + Vector3.new(0, 15, 0)
+					local tw = TweenInfo.new(0.6, Enum.EasingStyle.Quad, Enum.EasingDirection.In)
+					TweenService:Create(m.PrimaryPart, tw, {CFrame = upCF}):Play()
+					task.delay(tw.Time + 0.05, function() if m and m.Parent then m:Destroy() end end)
+				else
+					m:Destroy()
+				end
+			end
+			table.remove(list, i)
+		end
+		saveEquippedDebounced(player)
+	end)
+end
+
+--========================================================
+-- Mode helpers
+--========================================================
+local function getPlayerMode(player: Player): string
+	local v = player:FindFirstChild("AttackMode")
+	local m = v and string.upper(v.Value) or "FOCUS"
+	return (m == "SINGLE") and "SINGLE" or "FOCUS"
+end
+
+local function getFreeNFTsSorted(player: Player)
+	local res = {}
+	for _, nft in ipairs(EquippedNFTs[player] or {}) do
+		if nft and nft.Parent and not NFTBusy[nft] and nft:FindFirstChild("Power") then
+			table.insert(res, nft)
+		end
+	end
+	table.sort(res, function(a,b)
+		local av = (a.Power and a.Power.Value) or 0
+		local bv = (b.Power and b.Power.Value) or 0
+		return av > bv
+	end)
+	return res
+end
+local function arrangeAroundCoin(player: Player, coin: Model, state)
+	local n = #state.attackers
+	if n == 0 then return end
+
+	for i, holder in ipairs(state.attackers) do
+		if holder and holder.Parent and holder.PrimaryPart and coin and coin.Parent and coin.PrimaryPart then
+			startAttackerVisuals(player, coin, state, holder, i)
+
+			-- ✅ NEW: each holder has its own attack loop
+			startPerNftAttackLoop(player, coin, state, holder)
+		end
+	end
+end
+
+
+--========================================================
+-- SMALL HELPERS
+--========================================================
+hasActiveBoost = function(player, boostName)
+	local folder = player:FindFirstChild("ActiveBoostsFolder")
+	if folder and folder:IsA("Folder") then
+		local val = folder:FindFirstChild(boostName)
+		if val and val:IsA("IntValue") and val.Value > 0 then return true end
+	end
+
+	local playerData = ServerStorage:FindFirstChild(player.UserId .. "_Data")
+	if playerData then
+		local serverFolder = playerData:FindFirstChild("ActiveBoostsFolder")
+		if serverFolder and serverFolder:IsA("Folder") then
+			local val = serverFolder:FindFirstChild(boostName)
+			if val and val:IsA("IntValue") and val.Value > 0 then return true end
+		end
+	end
+	return false
+end
+
+local function hasBoolFlagCI(m, name)
+	local ln = string.lower(name)
+	for _, ch in ipairs(m:GetChildren()) do
+		if ch:IsA("ValueBase") and string.lower(ch.Name) == ln then
+			return (not ch:IsA("BoolValue")) or ch.Value == true
+		end
+	end
+	return false
+end
+local function hasAttrCI(m, name)
+	local v = m:GetAttribute(name)
+	if v ~= nil then return v == true or v == 1 or v == "true" end
+	v = m:GetAttribute(string.lower(name))
+	if v ~= nil then return v == true or v == 1 or v == "true" end
+	return false
+end
+local function getLootKind(m)
+	if hasBoolFlagCI(m, "IsCoin") or hasAttrCI(m, "IsCoin") then return "Coin" end
+	if hasBoolFlagCI(m, "IsGem")  or hasAttrCI(m, "IsGem")  then return "Gem"  end
+	if hasBoolFlagCI(m, "IsChest") or hasBoolFlagCI(m, "isChest") or hasAttrCI(m, "IsChest") then return "Chest" end
+	return "Coin"
+end
+
+--========================================================
+-- ZAMENA addOneAttacker (для SINGLE)
+--========================================================
+local function addOneAttacker(player, coin, state)
+	local free = getFreeNFTsSorted(player)
+	local nft = free[1]
+	if not nft then return false end
+
+	table.insert(state.attackers, nft)
+	NFTBusy[nft] = true
+	NFTTarget[nft] = coin
+
+	state.damageByNft = state.damageByNft or {}
+	state.damageByNft[nft] = state.damageByNft[nft] or 0
+
+	-- FX: attach NFT
+	if state.fxToken then
+		pcall(function() HackFX.AttachNft(coin, nft, state.fxToken) end)
+	end
+
+	-- visuals + loop
+	arrangeAroundCoin(player, coin, state)
+	startPerNftAttackLoop(player, coin, state, nft)
+
+	return true
+end
+
+
+local function clearPlayerAttackOnTarget(player, coin)
+	local st = ActiveAttacks[coin]
+	if not st or st.owner ~= player then return end
+
+	-- stop per-nft loops
+	if st.attackLoops then
+		for h,_ in pairs(st.attackLoops) do
+			st.attackLoops[h] = nil
+		end
+	end
+
+	for _, nft in ipairs(st.attackers or {}) do
+		-- 1) СНАЧАЛА вернуть визуал (stop поставит Busy=true на время реаттача)
+		stopAttackerVisuals(player, st, nft)
+
+		-- 2) ТОЛЬКО ПОТОМ отпустить follow
+		NFTBusy[nft] = false
+		NFTTarget[nft] = nil
+	end
+
+	-- stop FX
+	if st.fxToken then
+		pcall(function() HackFX.StopCoinFX(coin, st.fxToken, {shatter=false}) end)
+	end
+
+	ActiveAttacks[coin] = nil
+end
+
+
+--========================================================
+-- SELECTION / ATTACK (с учётом BG-мультипликатора монет) + FX
+--========================================================
+SelectCoinEvent.OnServerEvent:Connect(function(player, coin)
+	if not coin or not coin:IsA("Model") or not coin.PrimaryPart then return end
+	if not coin:FindFirstChild("Durability") then return end
+	if not EquippedNFTs[player] or #EquippedNFTs[player] == 0 then return end
+
+	local mode = getPlayerMode(player)
+
+	-- чужая цель уже кем-то занята
+	if ActiveAttacks[coin] and ActiveAttacks[coin].owner ~= player then return end
+
+	if mode == "FOCUS" then
+		-- повторный клик по той же монете = выключить фокус
+		if ActiveAttacks[coin] and ActiveAttacks[coin].owner == player then
+			local st = ActiveAttacks[coin]
+			if st and st.fxToken then pcall(function() HackFX.StopCoinFX(coin, st.fxToken, {shatter=false}) end) end
+
+			-- стопнуть loops
+			if st and st.attackLoops then
+				for h,_ in pairs(st.attackLoops) do st.attackLoops[h] = nil end
+			end
+
+			clearPlayerAttackOnTarget(player, coin)
+			ClearCircleEvent:FireClient(player, coin)
+			return
+		end
+
+		-- выключаем прошлую цель игрока (если была)
+		for c, st in pairs(ActiveAttacks) do
+			if st.owner == player and c ~= coin then
+				if st.fxToken then pcall(function() HackFX.StopCoinFX(c, st.fxToken, {shatter=false}) end) end
+				if st.attackLoops then
+					for h,_ in pairs(st.attackLoops) do st.attackLoops[h] = nil end
+				end
+				clearPlayerAttackOnTarget(player, c)
+				if c and c.Parent then ClearCircleEvent:FireClient(player, c) end
+			end
+		end
+
+		-- создаём state
+		ActiveAttacks[coin] = {
+			attackers    = {},
+			owner        = player,
+			keyboards    = {},
+			typingConns  = {},
+			damageByNft  = {},
+			fxToken      = nil,
+			attackLoops  = {}, -- ✅ важно
+		}
+		local state = ActiveAttacks[coin]
+
+		-- FX start
+		state.fxToken = HackFX.StartCoinFX(coin)
+
+		-- добавляем всех
+		for _, nft in ipairs(EquippedNFTs[player]) do
+			if nft and nft.Parent and nft.PrimaryPart then
+				table.insert(state.attackers, nft)
+				NFTBusy[nft] = true
+				NFTTarget[nft] = coin
+				state.damageByNft[nft] = 0
+
+				if state.fxToken then
+					pcall(function() HackFX.AttachNft(coin, nft, state.fxToken) end)
+				end
+			end
+		end
+
+		-- старт визуала + per-nft loops
+		arrangeAroundCoin(player, coin, state)
+
+	else
+		-- SINGLE
+		if ActiveAttacks[coin] and ActiveAttacks[coin].owner == player then
+			local st = ActiveAttacks[coin]
+			st.damageByNft = st.damageByNft or {}
+			local added = addOneAttacker(player, coin, st)
+			if not added then return end
+		else
+			ActiveAttacks[coin] = {
+				attackers    = {},
+				owner        = player,
+				keyboards    = {},
+				typingConns  = {},
+				damageByNft  = {},
+				fxToken      = nil,
+				attackLoops  = {}, -- ✅ важно
+			}
+			local st = ActiveAttacks[coin]
+
+			st.fxToken = HackFX.StartCoinFX(coin)
+
+			local added = addOneAttacker(player, coin, st)
+			if not added then
+				if st.fxToken then pcall(function() HackFX.StopCoinFX(coin, st.fxToken, {shatter=false}) end) end
+				ActiveAttacks[coin] = nil
+				return
+			end
+		end
+	end
+end)
+
+
+--========================================================
+-- [ATOMIC] Equip Best: применяем и сохраняем ИМЕННО желаемый список
+--========================================================
+local function applyEquippedLayoutServer(player: Player, desiredList: {string})
+	EquippedNFTs[player] = EquippedNFTs[player] or {}
+	local PlayerInventory = ServerStorage:FindFirstChild(player.UserId .. "_Data")
+	local nftsFolder = PlayerInventory and PlayerInventory:FindFirstChild("NFT")
+	if not nftsFolder then return {ok=false, err="inventory_missing"} end
+
+	local seen, clean = {}, {}
+	for _, id in ipairs(desiredList or {}) do
+		local uuid = tostring(id)
+		if uuid ~= "" and not seen[uuid] and nftsFolder:FindFirstChild(uuid) then
+			seen[uuid] = true
+			table.insert(clean, uuid)
+		end
+	end
+
+	local maxSlotsNow = getMaxEquipped(player)
+	local targetSetNow = {}
+	for i, uuid in ipairs(clean) do if i <= maxSlotsNow then targetSetNow[uuid] = true end end
+
+	for i = #EquippedNFTs[player], 1, -1 do
+		local m = EquippedNFTs[player][i]
+		if m and m.Parent and not targetSetNow[m.Name] then
+			unequipByUuidServer(player, m.Name)
+		end
+	end
+
+	for i, uuid in ipairs(clean) do
+		if i <= maxSlotsNow then
+			local _, exists = findEquippedModelByUuid(player, uuid)
+			if not exists then spawnEquippedModel(player, uuid) end
+		end
+	end
+
+	if #clean > maxSlotsNow then
+		PendingEquip[player] = {}
+		for i = maxSlotsNow + 1, #clean do table.insert(PendingEquip[player], clean[i]) end
+	else
+		PendingEquip[player] = nil
+	end
+
+	local key = tostring(player.UserId)
+	local payload = clean
+	local ok, err = pcall(function() EquippedStore:SetAsync(key, payload) end)
+	if not ok then
+		warn("[EquippedStore] hard save failed:", err)
+		return {ok=false, err="ds_set_failed"}
+	end
+
+	_lastDesiredEquipped[player] = table.clone(payload)
+	_pendingDirty[player] = false
+	if _saveDebounce[player] then task.cancel(_saveDebounce[player]); _saveDebounce[player] = nil end
+	_saveDueAt[player] = tick() + MIN_SAVE_INTERVAL
+
+	return {ok=true, equipped=payload}
+end
+
+ApplyEquippedLayoutRF.OnServerInvoke = function(player, desiredList)
+	return applyEquippedLayoutServer(player, desiredList)
+end
+
+--========================================================
+-- [PENDING] Догрузка при апгрейде
+--========================================================
+local function tryConsumePending(player)
+	local pend = PendingEquip[player]
+	if not pend or #pend == 0 then return end
+	local maxSlots = getMaxEquipped(player)
+	local have = # (EquippedNFTs[player] or {})
+	local free = math.max(0, maxSlots - have)
+	if free <= 0 then return end
+
+	local PlayerInventory = ServerStorage:FindFirstChild(player.UserId .. "_Data")
+	local nftsFolder = PlayerInventory and PlayerInventory:FindFirstChild("NFT")
+	if not nftsFolder then return end
+
+	local spawned, i = 0, 1
+	while i <= #pend and spawned < free do
+		local uuid = pend[i]
+		if nftsFolder:FindFirstChild(uuid) then
+			local ok = spawnEquippedModel(player, uuid)
+			if ok then table.remove(pend, i); spawned += 1 else i += 1 end
+		else
+			table.remove(pend, i)
+		end
+	end
+	saveEquippedDebounced(player)
+	if #pend == 0 then PendingEquip[player] = nil end
+end
+
+local function attachUpgradeWatcher(player)
+	if UpgradeConns[player] then UpgradeConns[player]:Disconnect(); UpgradeConns[player] = nil end
+	local PlayerData = ServerStorage:FindFirstChild(player.UserId .. "_Data")
+	if not PlayerData then return end
+	local PlayerUpgrades = PlayerData:FindFirstChild("PlayerUpgrades")
+	if not PlayerUpgrades then return end
+	local v = PlayerUpgrades:FindFirstChild("PlayerEquipmentUpgradeLvl")
+	if v and v:IsA("IntValue") then
+		UpgradeConns[player] = v:GetPropertyChangedSignal("Value"):Connect(function()
+			tryConsumePending(player)
+		end)
+	end
+end
+
+GetEquippedNftStatsRF.OnServerInvoke = function(player)
+	-- Собираем прямо из уже заспавненных моделей (EquippedNFTs[player])
+	local list = {}
+	local totalPower = 0
+	for _, m in ipairs(EquippedNFTs[player] or {}) do
+		if m and m.Parent then
+			local power = 0
+			local pVal = m:FindFirstChild("Power")
+			if pVal and pVal:IsA("ValueBase") then
+				power = tonumber(pVal.Value) or 0
+			end
+
+			-- coin multiplier берём из атрибута, иначе фоллбек по фону
+			local mult = m:GetAttribute("CoinMultiplier")
+			if mult == nil then
+				mult = getBgMultiplier(m:GetAttribute("Background"))
+			end
+			if (not mult) or mult == 0 then mult = 1.0 end
+
+			table.insert(list, {
+				uuid        = m.Name,
+				name        = m:GetAttribute("Nft") or m.Name,
+				background  = m:GetAttribute("Background"),
+				coinMult    = mult,
+				power       = power,
+			})
+			totalPower += power
+		end
+	end
+
+	return {
+		ok = true,
+		totalPower = totalPower,
+		count = #list,
+		list = list,
+	}
+end
+
+--========================================================
+-- [PERSIST] Восстановление/Сохранение
+--========================================================
+GetEquippedUuidsRF.OnServerInvoke = function(player)
+	-- если есть последняя желаемая раскладка – берём её
+	local desired = _lastDesiredEquipped[player]
+	if desired and #desired > 0 then
+		local copy = table.create(#desired)
+		for i, v in ipairs(desired) do
+			copy[i] = v
+		end
+		return copy
+	end
+
+	-- иначе фоллбек: что реально заспавнено
+	return getEquippedUuidList(player)
+end
+
+GetPlayerEquipmentBF.OnInvoke = function(player)
+	local list = {}
+	for _, m in ipairs(EquippedNFTs[player] or {}) do
+		if m and m.Parent then
+			local power = 0
+			local pVal = m:FindFirstChild("Power")
+			if pVal and pVal:IsA("ValueBase") then power = tonumber(pVal.Value) or 0 end
+			local mult = m:GetAttribute("CoinMultiplier")
+			if mult == nil then mult = getBgMultiplier(m:GetAttribute("Background")) end
+			if (not mult) or mult == 0 then mult = 1.0 end
+			table.insert(list, { power = power, coinMult = mult })
+		end
+	end
+	return list
+end
+
+local function restoreEquippedFor(player: Player)
+	EquippedNFTs[player] = {}
+	PendingEquip[player] = nil
+
+	local key = tostring(player.UserId)
+	local ok, saved = pcall(function() return EquippedStore:GetAsync(key) end)
+	if not ok or type(saved) ~= "table" then return end
+
+	-- *** ЧИСТКА СТАРЫХ ДУБЛЕЙ ИЗ DS ***
+	local seen = {}
+	local clean = {}
+	for _, id in ipairs(saved) do
+		local uuid = tostring(id)
+		if uuid ~= "" and not seen[uuid] then
+			seen[uuid] = true
+			table.insert(clean, uuid)
+		end
+	end
+	saved = clean
+
+	_lastDesiredEquipped[player] = table.clone(saved)
+
+	local maxSlots = getMaxEquipped(player)
+	local spawned = 0
+	for _, uuid in ipairs(saved) do
+		if spawned >= maxSlots then break end
+		if spawnEquippedModel(player, tostring(uuid)) then spawned += 1 end
+	end
+
+	if spawned < #saved then
+		PendingEquip[player] = {}
+		for i = spawned + 1, #saved do table.insert(PendingEquip[player], saved[i]) end
+	end
+
+	attachUpgradeWatcher(player)
+	task.delay(2, function()
+		if player and Players:FindFirstChild(player.Name) then tryConsumePending(player) end
+	end)
+
+	-- пересохраняем уже очищенный список в DS, чтобы навсегда убрать дубли
+	pcall(function()
+		EquippedStore:SetAsync(key, saved)
+	end)
+end
+
+Players.PlayerAdded:Connect(function(player)
+	task.defer(function() restoreEquippedFor(player) end)
+end)
+
+Players.PlayerRemoving:Connect(function(player)
+	removeAllPlayerNFTsFromAttacks(player)
+	local key = tostring(player.UserId)
+	local payload
+	if _lastDesiredEquipped[player] and #_lastDesiredEquipped[player] > 0 then
+		payload = _lastDesiredEquipped[player]
+	else
+		payload = getEquippedUuidList(player)
+	end
+	pcall(function() EquippedStore:SetAsync(key, payload) end)
+
+	if EquippedNFTs[player] then
+		for _, nft in ipairs(EquippedNFTs[player]) do
+			if nft and nft.Parent then nft:Destroy() end
+		end
+		EquippedNFTs[player] = nil
+	end
+
+	if UpgradeConns[player] then UpgradeConns[player]:Disconnect(); UpgradeConns[player] = nil end
+	PendingEquip[player] = nil
+	_lastDesiredEquipped[player] = nil
+	_suppressSave[player] = nil
+	_pendingDirty[player] = nil
+	if _saveDebounce[player] then task.cancel(_saveDebounce[player]); _saveDebounce[player] = nil end
+	_saveDueAt[player] = nil
+end)
