@@ -1,0 +1,6 @@
+-- StarterPlayerScripts/HackFxClient.client.lua
+-- Клиентский загрузчик HackFX: слушает RemoteEvent и создаёт локальные FX.
+
+local ReplicatedStorage = game:GetService("ReplicatedStorage")
+
+require(ReplicatedStorage:WaitForChild("HackFX"))

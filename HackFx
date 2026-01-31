@@ -1,4 +1,4 @@
--- ServerScriptService/HackFX.server.lua
+-- ReplicatedStorage/HackFX.lua
 -- FX взлома: диск + кольца + луч + mini-консоли + shatter + КРУПНЫЕ код-фразы.
 -- ВАЖНО: НЕТ НИ ОДНОГО ParticleEmitter (никаких точек из частиц).
 
@@ -6,6 +6,9 @@ local TweenService = game:GetService("TweenService")
 local RunService   = game:GetService("RunService")
 local Debris       = game:GetService("Debris")
 local HttpService  = game:GetService("HttpService")
+local ReplicatedStorage = game:GetService("ReplicatedStorage")
+
+local IS_CLIENT = RunService:IsClient()
 
 local HackFX = {}
 
@@ -37,10 +40,28 @@ local HACK_PHRASES = {
 	"SIG VALID",
 }
 
--- === Root ===
-local ROOT = workspace:FindFirstChild("HackFX") or Instance.new("Folder")
-ROOT.Name = "HackFX"
-ROOT.Parent = workspace
+local FXRemote = ReplicatedStorage:FindFirstChild("HackFXRemote")
+if not FXRemote then
+	if IS_CLIENT then
+		FXRemote = ReplicatedStorage:WaitForChild("HackFXRemote")
+	else
+		FXRemote = Instance.new("RemoteEvent")
+		FXRemote.Name = "HackFXRemote"
+		FXRemote.Parent = ReplicatedStorage
+	end
+end
+
+-- === Root (client-only) ===
+local ROOT
+local function getRoot()
+	if ROOT and ROOT.Parent then return ROOT end
+	if not IS_CLIENT then return nil end
+
+	ROOT = workspace:FindFirstChild("HackFX_Local") or Instance.new("Folder")
+	ROOT.Name = "HackFX_Local"
+	ROOT.Parent = workspace
+	return ROOT
+end
 
 -- === Helpers ===
 local function mk(parent, class, props)
@@ -93,8 +114,11 @@ end
 
 -- Осколки при завершении
 local function shatterAt(cf, color)
+	local root = getRoot()
+	if not root then return end
+
 	for _=1,8 do
-		local p = neonPart(ROOT, Vector3.new(0.3,0.3,0.3), cf, color or GREEN, 0)
+		local p = neonPart(root, Vector3.new(0.3,0.3,0.3), cf, color or GREEN, 0)
 		p.Velocity    = (cf.LookVector*10 + Vector3.new(math.random(-5,5), math.random(5,12), math.random(-5,5)))
 		p.RotVelocity = Vector3.new(math.random(-6,6), math.random(-6,6), math.random(-6,6))
 
@@ -221,7 +245,10 @@ local function buildCoinFX(coin)
 	local pp = safePP(coin)
 	if not pp then return nil end
 
-	local folder = mk(ROOT, "Folder", { Name = uniqueName("CoinFX") })
+	local root = getRoot()
+	if not root then return nil end
+
+	local folder = mk(root, "Folder", { Name = uniqueName("CoinFX") })
 
 	local r = math.max(pp.Size.X, pp.Size.Z) * 0.85
 
@@ -424,13 +451,26 @@ end
 
 -- === Public API ===
 
-function HackFX.StartCoinFX(coin)
-	local fx = buildCoinFX(coin)
-	if not fx then return nil end
-	return { coin = coin, coinFx = fx, nftFx = {}, alive = true }
+function HackFX.StartCoinFX(coin, owner)
+	if IS_CLIENT then
+		local fx = buildCoinFX(coin)
+		if not fx then return nil end
+		return { coin = coin, coinFx = fx, nftFx = {}, alive = true }
+	end
+
+	if not (owner and owner:IsA("Player")) then return nil end
+	local id = HttpService:GenerateGUID(false)
+	FXRemote:FireClient(owner, "start", id, coin)
+	return { id = id, owner = owner, alive = true }
 end
 
 function HackFX.AttachNft(coin, nft, token)
+	if not IS_CLIENT then
+		if not token or not token.owner or not token.id then return end
+		FXRemote:FireClient(token.owner, "attach", token.id, coin, nft)
+		return
+	end
+
 	if not token or not token.alive or not token.coinFx or token.nftFx[nft] then return end
 
 	local f    = mk(token.coinFx.folder,"Folder",{Name = uniqueName("NFT")})
@@ -445,6 +485,12 @@ function HackFX.AttachNft(coin, nft, token)
 end
 
 function HackFX.DetachNft(nft, token)
+	if not IS_CLIENT then
+		if not token or not token.owner or not token.id then return end
+		FXRemote:FireClient(token.owner, "detach", token.id, nil, nft)
+		return
+	end
+
 	local slot = token and token.nftFx and token.nftFx[nft]
 	if not slot then return end
 
@@ -467,6 +513,12 @@ function HackFX.DetachNft(nft, token)
 end
 
 function HackFX.StopCoinFX(coin, token, opts)
+	if not IS_CLIENT then
+		if not token or not token.owner or not token.id then return end
+		FXRemote:FireClient(token.owner, "stop", token.id, coin, nil, opts)
+		return
+	end
+
 	if not token or not token.coinFx then return end
 	token.alive = false
 
@@ -475,7 +527,7 @@ function HackFX.StopCoinFX(coin, token, opts)
 		shatterAt(pp.CFrame, GREEN)
 
 		local pulse = neonPart(
-			ROOT,
+			getRoot(),
 			Vector3.new(0.1,0.1,0.1),
 			pp.CFrame,
 			GREEN,
@@ -489,7 +541,7 @@ function HackFX.StopCoinFX(coin, token, opts)
 		Debris:AddItem(pulse,0.4)
 
 		if SOUND_ENABLED and SND_HIT_ID ~= "" then
-			local s = trySound(ROOT,SND_HIT_ID,0.7,1.0)
+			local s = trySound(getRoot(),SND_HIT_ID,0.7,1.0)
 			if s then s:Play(); Debris:AddItem(s,2) end
 		end
 	end
@@ -511,6 +563,35 @@ function HackFX.StopCoinFX(coin, token, opts)
 	end
 
 	token.coinFx = nil
+end
+
+if IS_CLIENT then
+	local clientTokens = {}
+
+	FXRemote.OnClientEvent:Connect(function(action, tokenId, coin, nft, opts)
+		if type(action) ~= "string" or not tokenId then return end
+
+		if action == "start" then
+			if clientTokens[tokenId] then return end
+			local token = HackFX.StartCoinFX(coin)
+			if token then
+				clientTokens[tokenId] = token
+			end
+			return
+		end
+
+		local token = clientTokens[tokenId]
+		if not token then return end
+
+		if action == "attach" then
+			HackFX.AttachNft(coin, nft, token)
+		elseif action == "detach" then
+			HackFX.DetachNft(nft, token)
+		elseif action == "stop" then
+			HackFX.StopCoinFX(coin, token, opts)
+			clientTokens[tokenId] = nil
+		end
+	end)
 end
 
 return HackFX
