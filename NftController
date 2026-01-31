@@ -287,7 +287,7 @@ local PayEvent            = ServerStorage:FindFirstChild("Pay") -- NOTE: НЕ и
 local AddPlayerBoostEvent = ServerStorage:WaitForChild("AddPlayerBoost")
 
 -- HackFX (встраиваем визуалки взлома)
-local HackFX = require(game.ServerScriptService:WaitForChild("HackFX"))
+local HackFX = require(game.ReplicatedStorage:WaitForChild("HackFX"))
 
 -- [PS99 STREAM] внешние модули
 local OrbService       = require(game.ServerStorage:WaitForChild("OrbService"))
@@ -3070,9 +3070,6 @@ local function playAttackHit(attackFig: Instance, coin: Model, onImpact: ((Vecto
 				pcall(function() _hitStopPart(getCoinPrimaryPart(), 0.08) end)
 				pcall(function() coinCritImpulse(coin, dir) end)
 				pcall(function() _spawnCritFX(impactPos, coin, jumpModel) end)
-				pcall(function()
-					spawnFallingTextAt(impactPos, "CRIT!", Color3.fromRGB(255, 220, 60), 0.95)
-				end)
 			else
 				local strength = (prof.impactStrength or 1.0) * _lerp(0.92, 1.12, rangeSeed)
 				pcall(function() coinImpulse(coin, dir, strength) end)
@@ -4044,7 +4041,7 @@ SelectCoinEvent.OnServerEvent:Connect(function(player, coin)
 		local state = ActiveAttacks[coin]
 
 		-- FX start
-		state.fxToken = HackFX.StartCoinFX(coin)
+		state.fxToken = HackFX.StartCoinFX(coin, player)
 
 		-- добавляем всех
 		for _, nft in ipairs(EquippedNFTs[player]) do
@@ -4082,7 +4079,7 @@ SelectCoinEvent.OnServerEvent:Connect(function(player, coin)
 			}
 			local st = ActiveAttacks[coin]
 
-			st.fxToken = HackFX.StartCoinFX(coin)
+			st.fxToken = HackFX.StartCoinFX(coin, player)
 
 			local added = addOneAttacker(player, coin, st)
 			if not added then
