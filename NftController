@@ -4161,7 +4161,7 @@ end
 --========================================================
 -- [PENDING] Догрузка при апгрейде
 --========================================================
-local function tryConsumePending(player)
+PendingEquip.TryConsumePending = function(player)
 	local pend = PendingEquip[player]
 	if not pend or #pend == 0 then return end
 	local maxSlots = getMaxEquipped(player)
@@ -4187,7 +4187,7 @@ local function tryConsumePending(player)
 	if #pend == 0 then PendingEquip[player] = nil end
 end
 
-local function attachUpgradeWatcher(player)
+PendingEquip.AttachUpgradeWatcher = function(player)
 	if UpgradeConns[player] then UpgradeConns[player]:Disconnect(); UpgradeConns[player] = nil end
 	local PlayerData = ServerStorage:FindFirstChild(player.UserId .. "_Data")
 	if not PlayerData then return end
@@ -4196,7 +4196,7 @@ local function attachUpgradeWatcher(player)
 	local v = PlayerUpgrades:FindFirstChild("PlayerEquipmentUpgradeLvl")
 	if v and v:IsA("IntValue") then
 		UpgradeConns[player] = v:GetPropertyChangedSignal("Value"):Connect(function()
-			tryConsumePending(player)
+			PendingEquip.TryConsumePending(player)
 		end)
 	end
 end
@@ -4273,7 +4273,7 @@ GetPlayerEquipmentBF.OnInvoke = function(player)
 	return list
 end
 
-local function restoreEquippedFor(player: Player)
+PendingEquip.RestoreEquippedFor = function(player: Player)
 	EquippedNFTs[player] = {}
 	PendingEquip[player] = nil
 
@@ -4307,9 +4307,9 @@ local function restoreEquippedFor(player: Player)
 		for i = spawned + 1, #saved do table.insert(PendingEquip[player], saved[i]) end
 	end
 
-	attachUpgradeWatcher(player)
+	PendingEquip.AttachUpgradeWatcher(player)
 	task.delay(2, function()
-		if player and Players:FindFirstChild(player.Name) then tryConsumePending(player) end
+		if player and Players:FindFirstChild(player.Name) then PendingEquip.TryConsumePending(player) end
 	end)
 
 	-- пересохраняем уже очищенный список в DS, чтобы навсегда убрать дубли
@@ -4319,7 +4319,7 @@ local function restoreEquippedFor(player: Player)
 end
 
 Players.PlayerAdded:Connect(function(player)
-	task.defer(function() restoreEquippedFor(player) end)
+	task.defer(function() PendingEquip.RestoreEquippedFor(player) end)
 end)
 
 Players.PlayerRemoving:Connect(function(player)
