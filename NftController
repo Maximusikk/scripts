@@ -14,6 +14,23 @@ local Backgrounds = {
 	PeachSunset={multiple=1.5}, CrimsonShockWave={multiple=2}, EmeraldCrystal={multiple=2},
 	GoldBullion={multiple=3}, RubyGemstone={multiple=3}, RoyalCrown={multiple=5},
 }
+
+local ReplicatedStorage = game:GetService("ReplicatedStorage")
+
+local LocalHintTextRE = ReplicatedStorage:FindFirstChild("LocalHintText")
+if not LocalHintTextRE then
+	LocalHintTextRE = Instance.new("RemoteEvent")
+	LocalHintTextRE.Name = "LocalHintText"
+	LocalHintTextRE.Parent = ReplicatedStorage
+end
+
+local function sendLocalText(player: Player, position: Vector3, text: string, color: Color3?, yOffset: number?)
+	if not player then return end
+	if typeof(position) ~= "Vector3" then return end
+	if type(text) ~= "string" then return end
+	LocalHintTextRE:FireClient(player, position, text, color or Color3.new(1,1,1), yOffset or 0)
+end
+
 local function getBgMultiplier(bgName:string?)
 	if not bgName or bgName == "" then return 1.0 end
 	local row = Backgrounds[tostring(bgName)]
@@ -3194,7 +3211,7 @@ local function applyOneHitDamage(player: Player, coin: Model, state, holder: Mod
 	StreamedRewards.ProcessTick(player, coin, effMap)
 
 	-- =====================================================
-	-- ✅ FIX: falling hint text throttling (no spam)
+	-- ✅ FIX: falling hint text throttling (LOCAL ONLY)
 	-- =====================================================
 	do
 		local pp = coin.PrimaryPart
@@ -3207,36 +3224,30 @@ local function applyOneHitDamage(player: Player, coin: Model, state, holder: Mod
 				_coinHintState[coin] = st
 			end
 
-			-- Базовый кулдаун между любыми подсказками на монете
 			local COOLDOWN = 0.55
-
-			-- Шанс показать подсказку на обычный удар
 			local CHANCE = 0.30
-
-			-- Иногда делаем маленький “бурст” из 2 подсказок, но тоже под контролем
 			local BURST_CHANCE = 0.08
 			local BURST_SIZE = 2
 
 			local canShow = (now - (st.tLast or 0)) >= COOLDOWN
-
 			if canShow then
 				local show = (math.random() < CHANCE) or (st.burstLeft and st.burstLeft > 0)
 
 				if show then
 					st.tLast = now
 
-					-- если бурст активен — уменьшаем
 					if st.burstLeft and st.burstLeft > 0 then
 						st.burstLeft -= 1
 					else
-						-- иногда запускаем бурст
 						if math.random() < BURST_CHANCE then
 							st.burstLeft = BURST_SIZE - 1
 						end
 					end
 
+					-- ✅ ВАЖНО: показываем ТОЛЬКО owner игроку
 					pcall(function()
-						spawnFallingTextAt(
+						sendLocalText(
+							state.owner,
 							pp.Position,
 							randomSeedHint(),
 							Color3.fromRGB(120, 255, 170),
@@ -3260,9 +3271,10 @@ local function applyOneHitDamage(player: Player, coin: Model, state, holder: Mod
 		-- можно почистить хинт-state, чтобы не держать ссылку
 		_coinHintState[coin] = nil
 
+		-- ✅ Success ТОЛЬКО локально owner
 		if coin.PrimaryPart then
 			pcall(function()
-				spawnFallingTextAt(coin.PrimaryPart.Position, "Success", Color3.new(0,1,0), 0)
+				sendLocalText(state.owner, coin.PrimaryPart.Position, "Success", Color3.new(0,1,0), 0)
 			end)
 		end
 
@@ -3319,11 +3331,9 @@ local function startPerNftAttackLoop(player: Player, coin: Model, state, holder:
 		local fig = state.attackFigures and state.attackFigures[holder]
 		if not (fig and fig.Parent) then return nil end
 
-		-- темп конкретной фигуры (0..1)
 		local tempoSeed = fig:GetAttribute("AtkTempoSeed")
 		if typeof(tempoSeed) ~= "number" then tempoSeed = math.random() end
 
-		-- стабильная фаза (0..1), чтобы они НЕ начинали одновременно
 		local phase = fig:GetAttribute("AtkPhase")
 		if typeof(phase) ~= "number" then
 			phase = math.random()
@@ -3336,7 +3346,7 @@ local function startPerNftAttackLoop(player: Player, coin: Model, state, holder:
 	task.spawn(function()
 		-- ждём пока фигура реально готова
 		local fig, tempoSeed, phase
-		for _ = 1, 80 do -- ~6-7 сек максимум ожидания
+		for _ = 1, 80 do
 			if not (state.attackLoops and state.attackLoops[holder]) then return end
 			if not (coin and coin.Parent and coin:FindFirstChild("Durability")) then return end
 			if not ActiveAttacks[coin] or ActiveAttacks[coin] ~= state then return end
@@ -3359,15 +3369,10 @@ local function startPerNftAttackLoop(player: Player, coin: Model, state, holder:
 			return
 		end
 
-		-- ✅ СТАБИЛЬНЫЙ темп для этой фигуры:
-		-- tempoSeed=0 -> чуть медленнее, tempoSeed=1 -> быстрее
-		local tempoMult = 1.12 - (tempoSeed * 0.28)  -- диапазон примерно 1.12..0.84
-
-		-- ✅ СТАБИЛЬНАЯ фаза: разносит старт по времени
+		local tempoMult = 1.12 - (tempoSeed * 0.28)
 		local initialDelay = 0.25 + phase * (BASE * 1.15)
 		task.wait(initialDelay)
 
-		-- ✅ отдельный “личный” таймер, чтобы без пачек
 		local nextAt = tick()
 
 		while state.attackLoops and state.attackLoops[holder] do
@@ -3377,7 +3382,6 @@ local function startPerNftAttackLoop(player: Player, coin: Model, state, holder:
 			if not (holder and holder.Parent) then break end
 			if coin.Durability.Value <= 0 then break end
 
-			-- актуальная фигура (может пересоздаться)
 			local figNow = state.attackFigures and state.attackFigures[holder]
 			if not (figNow and figNow.Parent) then
 				task.wait(0.08)
@@ -3390,7 +3394,6 @@ local function startPerNftAttackLoop(player: Player, coin: Model, state, holder:
 				continue
 			end
 
-			-- если мы пришли раньше планового nextAt — ждём
 			local now = tick()
 			if now < nextAt then
 				task.wait(math.min(0.12, nextAt - now))
@@ -3406,18 +3409,23 @@ local function startPerNftAttackLoop(player: Player, coin: Model, state, holder:
 				dmg = dmg * 2
 			end
 
-			-- SAFE: не даём перекрываться
-			playAttackHitSafe(figNow, coin, function(_impactPos)
+			playAttackHitSafe(figNow, coin, function(impactPos)
 				if not (coin and coin.Parent and coin:FindFirstChild("Durability")) then return end
 				if coin.Durability.Value <= 0 then return end
 
 				local mult = tonumber(figNow:GetAttribute("LastCritMult")) or 1.0
+
+				-- ✅ CRIT текст ТОЛЬКО локально owner
+				if mult > 1.01 and typeof(impactPos) == "Vector3" then
+					pcall(function()
+						sendLocalText(state.owner, impactPos, "CRIT!", Color3.fromRGB(255, 220, 60), 0.95)
+					end)
+				end
+
 				applyOneHitDamage(player, coin, state, holder, dmg * mult)
 			end)
 
-			-- ✅ следующее время удара: личный интервал с темпом + небольшой jitter
 			local interval = (BASE * tempoMult) + (math.random() * JIT)
-			-- лёгкая защита от “схождения фаз” со временем
 			interval = interval + (math.random() * 0.08)
 			nextAt = now + interval
 		end
@@ -3492,7 +3500,7 @@ local function moveNFTInFormation(player, nftModel, index, alpha, t)
 		local p = nftModel:FindFirstChildWhichIsA("BasePart")
 		if p then nftModel.PrimaryPart = p else return end
 	end
-	
+
 	local targetCF = computeHolderTargetCF(player, index, t)
 	if not targetCF then return end
 
