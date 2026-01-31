@@ -7,9 +7,8 @@ local RunService   = game:GetService("RunService")
 local Debris       = game:GetService("Debris")
 local HttpService  = game:GetService("HttpService")
 local ReplicatedStorage = game:GetService("ReplicatedStorage")
-local Players = game:GetService("Players")
 
-local IS_CLIENT = RunService:IsClient() or (Players.LocalPlayer ~= nil)
+local IS_CLIENT = RunService:IsClient()
 
 local HackFX = {}
 
