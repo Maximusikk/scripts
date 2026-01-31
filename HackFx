@@ -275,6 +275,17 @@ local function buildCoinFX(coin)
 			if rotConn then rotConn:Disconnect() end
 			return
 		end
+		if pp then
+			local fx = folder:FindFirstChild("HackFX_LastCF")
+			if not fx then
+				fx = Instance.new("CFrameValue")
+				fx.Name = "HackFX_LastCF"
+				fx.Value = pp.CFrame
+				fx.Parent = folder
+			else
+				fx.Value = pp.CFrame
+			end
+		end
 		disk.CFrame = CFrame.new(disk.Position) * CFrame.Angles(0, tick()*math.rad(20), 0)
 	end)
 
@@ -446,6 +457,7 @@ local function buildCoinFX(coin)
 		label   = lbl,
 		rotConn = rotConn,
 		loopSnd = loopSnd,
+		lastCF  = pp.CFrame,
 	}
 end
 
@@ -523,13 +535,27 @@ function HackFX.StopCoinFX(coin, token, opts)
 	token.alive = false
 
 	local pp = safePP(coin)
-	if opts and opts.shatter and pp then
-		shatterAt(pp.CFrame, GREEN)
+	local shatterCF
+	if pp then
+		shatterCF = pp.CFrame
+	else
+		local fx = token and token.coinFx
+		if fx and fx.folder then
+			local last = fx.folder:FindFirstChild("HackFX_LastCF")
+			if last and last:IsA("CFrameValue") then
+				shatterCF = last.Value
+			elseif fx.lastCF then
+				shatterCF = fx.lastCF
+			end
+		end
+	end
+	if opts and opts.shatter and shatterCF then
+		shatterAt(shatterCF, GREEN)
 
 		local pulse = neonPart(
 			getRoot(),
 			Vector3.new(0.1,0.1,0.1),
-			pp.CFrame,
+			shatterCF,
 			GREEN,
 			0.2
 		)
