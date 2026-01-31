@@ -1,0 +1,516 @@
+-- ServerScriptService/HackFX.server.lua
+-- FX взлома: диск + кольца + луч + mini-консоли + shatter + КРУПНЫЕ код-фразы.
+-- ВАЖНО: НЕТ НИ ОДНОГО ParticleEmitter (никаких точек из частиц).
+
+local TweenService = game:GetService("TweenService")
+local RunService   = game:GetService("RunService")
+local Debris       = game:GetService("Debris")
+local HttpService  = game:GetService("HttpService")
+
+local HackFX = {}
+
+-- === Config ===
+local TEX_RING  = "rbxassetid://1017229443"
+local TEX_HEX   = "rbxassetid://1217159492"
+
+local SOUND_ENABLED = false
+local SND_LOOP_ID, SND_HIT_ID, SND_START_ID = "", "", ""
+
+local LOD_MINI_CONSOLE_MAX_DIST = 45
+
+local GREEN   = Color3.fromRGB( 60,255,170)
+local CYAN    = Color3.fromRGB(120,245,255)
+local MAGENTA = Color3.fromRGB(198,120,255)
+
+-- фразы-код, по 2–3 слова
+local HACK_PHRASES = {
+	"BLOCK HASH OK",
+	"SIG CHECK",
+	"NONCE ++",
+	"VERIFY KEY",
+	"MERKLE CHECK",
+	"TXN INDEXED",
+	"CHAIN SYNC",
+	"NODE ONLINE",
+	"LEDGER UPDATE",
+	"KEYPAIR OK",
+	"SIG VALID",
+}
+
+-- === Root ===
+local ROOT = workspace:FindFirstChild("HackFX") or Instance.new("Folder")
+ROOT.Name = "HackFX"
+ROOT.Parent = workspace
+
+-- === Helpers ===
+local function mk(parent, class, props)
+	local o = Instance.new(class)
+	if props then
+		for k,v in pairs(props) do
+			o[k] = v
+		end
+	end
+	o.Parent = parent
+	return o
+end
+
+local function uniqueName(prefix)
+	return string.format("%s_%s", prefix or "FX", HttpService:GenerateGUID(false))
+end
+
+local function safePP(model)
+	if not model or not model.Parent then return nil end
+	if model.PrimaryPart then return model.PrimaryPart end
+	local p = model:FindFirstChildWhichIsA("BasePart")
+	if p then model.PrimaryPart = p end
+	return model.PrimaryPart
+end
+
+local function neonPart(parent, size, cf, color3, transparency, shape)
+	return mk(parent, "Part", {
+		Anchored      = true,
+		CanCollide    = false,
+		CanQuery      = false,
+		CanTouch      = false,
+		Material      = Enum.Material.Neon,
+		Color         = color3 or GREEN,
+		Size          = size or Vector3.new(1,1,1),
+		CFrame        = cf or CFrame.new(),
+		Transparency  = transparency or 0.1,
+		Shape         = shape or Enum.PartType.Block,
+	})
+end
+
+local function trySound(parent, id, vol, pitch)
+	if not SOUND_ENABLED or id == "" then return end
+	return mk(parent, "Sound", {
+		SoundId            = id,
+		Volume             = vol or 0.6,
+		PlaybackSpeed      = pitch or 1.0,
+		RollOffMaxDistance = 80,
+	})
+end
+
+-- Осколки при завершении
+local function shatterAt(cf, color)
+	for _=1,8 do
+		local p = neonPart(ROOT, Vector3.new(0.3,0.3,0.3), cf, color or GREEN, 0)
+		p.Velocity    = (cf.LookVector*10 + Vector3.new(math.random(-5,5), math.random(5,12), math.random(-5,5)))
+		p.RotVelocity = Vector3.new(math.random(-6,6), math.random(-6,6), math.random(-6,6))
+
+		TweenService:Create(
+			p,
+			TweenInfo.new(0.45, Enum.EasingStyle.Quad, Enum.EasingDirection.Out),
+			{ Transparency = 1 }
+		):Play()
+
+		Debris:AddItem(p, 0.5)
+	end
+end
+
+-- Beam NFT→Coin (неоновый луч без текстур/частиц)
+local function buildNftBeam(nft, coin, parent)
+	local np, cp = safePP(nft), safePP(coin)
+	if not np or not cp then return nil end
+
+	local atN = mk(np, "Attachment", { Name = uniqueName("HackFX_Attach_N") })
+	local atC = mk(cp, "Attachment", { Name = uniqueName("HackFX_Attach_C") })
+
+	local beamObj = mk(parent, "Beam", {
+		Attachment0   = atN,
+		Attachment1   = atC,
+		FaceCamera    = false,
+
+		Width0        = 0.55,
+		Width1        = 0.55,
+
+		LightEmission = 0.9,
+		LightInfluence= 0.0,
+
+		Color = ColorSequence.new{
+			ColorSequenceKeypoint.new(0, GREEN),
+			ColorSequenceKeypoint.new(1, MAGENTA),
+		},
+
+		Transparency = NumberSequence.new{
+			NumberSequenceKeypoint.new(0, 0.05),
+			NumberSequenceKeypoint.new(1, 0.3),
+		},
+
+		CurveSize0 = 2,
+		CurveSize1 = -2,
+	})
+
+	return {
+		atN   = atN,
+		atC   = atC,
+		beam  = beamObj,
+	}
+end
+
+-- Мини-консоль у NFT (DECRYPTING...)
+local function buildMiniConsole(nft, parent)
+	local np = safePP(nft)
+	if not np then return nil end
+
+	local anchor = mk(parent, "Part", {
+		Anchored     = true,
+		CanCollide   = false,
+		CanQuery     = false,
+		CanTouch     = false,
+		Transparency = 1,
+		Size         = Vector3.new(0.2,0.2,0.2),
+		CFrame       = np.CFrame * CFrame.new(0, 2.3, 0),
+		Name         = uniqueName("HackFX_MiniConsoleAnchor"),
+	})
+
+	local bb = mk(anchor, "BillboardGui", {
+		Size           = UDim2.fromOffset(180,60),
+		AlwaysOnTop    = true,
+		LightInfluence = 0,
+		ZIndexBehavior = Enum.ZIndexBehavior.Sibling,
+		Name           = "MiniConsoleGui",
+	})
+
+	local lbl = mk(bb,"TextLabel",{
+		BackgroundTransparency = 1,
+		Font            = Enum.Font.Code,
+		TextScaled      = true,
+		TextWrapped     = false,
+		TextXAlignment  = Enum.TextXAlignment.Center,
+		TextYAlignment  = Enum.TextYAlignment.Center,
+		TextColor3      = CYAN,
+		TextTransparency= 0.15,
+		Text            = "DECRYPTING...",
+		Name            = "MiniConsoleLabel",
+	})
+
+	mk(lbl,"UIStroke",{
+		Thickness = 1.4,
+		Color     = Color3.new(0,0,0),
+	})
+
+	-- плавающее движение над NFT
+	task.spawn(function()
+		local t0 = tick()
+		while anchor.Parent and np.Parent do
+			local t = tick() - t0
+			anchor.CFrame = np.CFrame * CFrame.new(0, 2.2 + math.sin(t*2)*0.15, 0)
+			RunService.Heartbeat:Wait()
+		end
+		if anchor and anchor.Parent then
+			anchor:Destroy()
+		end
+	end)
+
+	TweenService:Create(
+		lbl,
+		TweenInfo.new(0.8, Enum.EasingStyle.Sine, Enum.EasingDirection.InOut, -1, true),
+		{ TextTransparency = 0.35 }
+	):Play()
+
+	return {
+		anchor = anchor,
+		bb     = bb,
+		lbl    = lbl,
+	}
+end
+
+-- === Coin FX / центр взлома ===
+local function buildCoinFX(coin)
+	local pp = safePP(coin)
+	if not pp then return nil end
+
+	local folder = mk(ROOT, "Folder", { Name = uniqueName("CoinFX") })
+
+	local r = math.max(pp.Size.X, pp.Size.Z) * 0.85
+
+	-- HEX-диск
+	local disk = neonPart(
+		folder,
+		Vector3.new(r*2.2, 0.3, r*2.2),
+		CFrame.new(pp.Position),
+		CYAN,
+		0.35
+	)
+	disk.Shape = Enum.PartType.Cylinder
+
+	mk(disk, "Decal", {
+		Face         = Enum.NormalId.Top,
+		Transparency = 0.25,
+		Texture      = TEX_HEX,
+		Color3       = CYAN,
+	})
+
+	local rotConn
+	rotConn = RunService.Heartbeat:Connect(function()
+		if not disk or not disk.Parent then
+			if rotConn then rotConn:Disconnect() end
+			return
+		end
+		disk.CFrame = CFrame.new(disk.Position) * CFrame.Angles(0, tick()*math.rad(20), 0)
+	end)
+
+	-- Пульс-кольца
+	for _=1,2 do
+		local ring = neonPart(
+			folder,
+			Vector3.new(r*1.8,0.2,r*1.8),
+			CFrame.new(pp.Position),
+			GREEN,
+			0.65
+		)
+
+		local sg = mk(ring,"SurfaceGui",{
+			Face          = Enum.NormalId.Top,
+			SizingMode    = Enum.SurfaceGuiSizingMode.PixelsPerStud,
+			PixelsPerStud = 60,
+			AlwaysOnTop   = true,
+		})
+
+		mk(sg,"ImageLabel",{
+			BackgroundTransparency = 1,
+			Image            = TEX_RING,
+			ImageTransparency= 0.2,
+			Size             = UDim2.fromScale(1,1),
+		})
+
+		task.spawn(function()
+			while ring.Parent and pp.Parent do
+				ring.Size   = Vector3.new(0.1,0.2,0.1)
+				ring.CFrame = CFrame.new(pp.Position)
+
+				TweenService:Create(
+					ring,
+					TweenInfo.new(0.8, Enum.EasingStyle.Quad, Enum.EasingDirection.Out),
+					{ Size = Vector3.new(r*1.9,0.2,r*1.9), Transparency = 0.95 }
+				):Play()
+
+				task.wait(0.4)
+			end
+		end)
+	end
+
+	----------------------------------------------------------------
+	-- КРУПНЫЕ КОД-ФРАЗЫ ВОКРУГ МОНЕТЫ (только текст)
+	----------------------------------------------------------------
+	local function randomPhrase()
+		return HACK_PHRASES[math.random(1, #HACK_PHRASES)]
+	end
+
+	local function spawnCodePhrase()
+		if not (folder.Parent and pp.Parent) then return end
+
+		local radius = r * 1.4
+		local angle  = math.random() * math.pi * 2
+
+		local offsetX = math.cos(angle) * radius
+		local offsetZ = math.sin(angle) * radius
+
+		local anchor = mk(folder,"Part",{
+			Anchored     = true,
+			CanCollide   = false,
+			CanQuery     = false,
+			CanTouch     = false,
+			Transparency = 1,
+			Size         = Vector3.new(0.2,0.2,0.2),
+			CFrame       = pp.CFrame * CFrame.new(offsetX, 2.2, offsetZ),
+		})
+
+		local bb = mk(anchor,"BillboardGui",{
+			Size           = UDim2.fromOffset(260,50), -- ОЧЕНЬ крупно
+			AlwaysOnTop    = true,
+			LightInfluence = 0,
+			ZIndexBehavior = Enum.ZIndexBehavior.Sibling,
+		})
+
+		local lbl = mk(bb,"TextLabel",{
+			BackgroundTransparency = 0.25,
+			BackgroundColor3 = Color3.fromRGB(5,25,10),
+			Font            = Enum.Font.Code,
+			TextScaled      = true,
+			TextWrapped     = false,
+			TextXAlignment  = Enum.TextXAlignment.Center,
+			TextYAlignment  = Enum.TextYAlignment.Center,
+			TextColor3      = GREEN,
+			TextTransparency= 0.05,
+			Text            = randomPhrase(),
+		})
+
+		mk(lbl,"UIStroke",{
+			Thickness = 1.6,
+			Color     = Color3.new(0,0,0),
+		})
+
+		-- лёгкое движение и исчезновение
+		local endOffsetY = 0.8
+		local endOffsetX = offsetX * 0.5
+		local endOffsetZ = offsetZ * 0.5
+		local t = 0.9
+
+		TweenService:Create(
+			anchor,
+			TweenInfo.new(t, Enum.EasingStyle.Quad, Enum.EasingDirection.Out),
+			{ CFrame = pp.CFrame * CFrame.new(endOffsetX, endOffsetY, endOffsetZ) }
+		):Play()
+
+		TweenService:Create(
+			lbl,
+			TweenInfo.new(t, Enum.EasingStyle.Quad, Enum.EasingDirection.Out),
+			{ TextTransparency = 1 }
+		):Play()
+
+		Debris:AddItem(anchor, t + 0.1)
+	end
+
+	task.spawn(function()
+		while folder.Parent and pp.Parent do
+			spawnCodePhrase()
+			task.wait(0.18)  -- частота появления фраз
+		end
+	end)
+	----------------------------------------------------------------
+
+	-- Статичный DECRYPTING... над монетой
+	local bb = mk(folder,"BillboardGui",{
+		Adornee               = pp,
+		Size                  = UDim2.new(0,220,0,52),
+		StudsOffsetWorldSpace = Vector3.new(0, 1.35, 0),
+		AlwaysOnTop           = true,
+		LightInfluence        = 0,
+		ZIndexBehavior        = Enum.ZIndexBehavior.Global,
+	})
+
+	local lbl = mk(bb,"TextLabel",{
+		Size                   = UDim2.new(1,0,1,0),
+		BackgroundTransparency = 1,
+		Font                = Enum.Font.Code,
+		TextScaled          = true,
+		TextWrapped         = false,
+		TextXAlignment      = Enum.TextXAlignment.Center,
+		TextYAlignment      = Enum.TextYAlignment.Center,
+		TextColor3          = GREEN,
+		TextTransparency    = 0.08,
+		Text                = "DECRYPTING...",
+	})
+
+	mk(lbl,"UIStroke",{
+		Thickness = 1.4,
+		Color     = Color3.new(0,0,0),
+	})
+
+	-- звуки
+	if SOUND_ENABLED and SND_START_ID ~= "" then
+		local s = trySound(folder,SND_START_ID,0.6,1.0)
+		if s then s:Play(); Debris:AddItem(s,3) end
+	end
+
+	local loopSnd
+	if SOUND_ENABLED and SND_LOOP_ID ~= "" then
+		loopSnd = trySound(folder,SND_LOOP_ID,0.25,1.0)
+		if loopSnd then loopSnd.Looped = true; loopSnd:Play() end
+	end
+
+	return {
+		folder  = folder,
+		pp      = pp,
+		disk    = disk,
+		labelGui= bb,
+		label   = lbl,
+		rotConn = rotConn,
+		loopSnd = loopSnd,
+	}
+end
+
+-- === Public API ===
+
+function HackFX.StartCoinFX(coin)
+	local fx = buildCoinFX(coin)
+	if not fx then return nil end
+	return { coin = coin, coinFx = fx, nftFx = {}, alive = true }
+end
+
+function HackFX.AttachNft(coin, nft, token)
+	if not token or not token.alive or not token.coinFx or token.nftFx[nft] then return end
+
+	local f    = mk(token.coinFx.folder,"Folder",{Name = uniqueName("NFT")})
+	local beam = buildNftBeam(nft, coin, f)
+	local mini = buildMiniConsole(nft, f)
+
+	token.nftFx[nft] = {
+		folder = f,
+		beam   = beam,
+		mini   = mini,
+	}
+end
+
+function HackFX.DetachNft(nft, token)
+	local slot = token and token.nftFx and token.nftFx[nft]
+	if not slot then return end
+
+	if slot.beam then
+		local b = slot.beam
+		if b.beam and b.beam.Parent then b.beam:Destroy() end
+		if b.atN  and b.atN.Parent  then b.atN:Destroy()  end
+		if b.atC  and b.atC.Parent  then b.atC:Destroy()  end
+	end
+
+	if slot.mini and slot.mini.anchor and slot.mini.anchor.Parent then
+		slot.mini.anchor:Destroy()
+	end
+
+	if slot.folder and slot.folder.Parent then
+		slot.folder:Destroy()
+	end
+
+	token.nftFx[nft] = nil
+end
+
+function HackFX.StopCoinFX(coin, token, opts)
+	if not token or not token.coinFx then return end
+	token.alive = false
+
+	local pp = safePP(coin)
+	if opts and opts.shatter and pp then
+		shatterAt(pp.CFrame, GREEN)
+
+		local pulse = neonPart(
+			ROOT,
+			Vector3.new(0.1,0.1,0.1),
+			pp.CFrame,
+			GREEN,
+			0.2
+		)
+		TweenService:Create(
+			pulse,
+			TweenInfo.new(0.35, Enum.EasingStyle.Quad, Enum.EasingDirection.Out),
+			{ Size = Vector3.new(18,18,18), Transparency = 1 }
+		):Play()
+		Debris:AddItem(pulse,0.4)
+
+		if SOUND_ENABLED and SND_HIT_ID ~= "" then
+			local s = trySound(ROOT,SND_HIT_ID,0.7,1.0)
+			if s then s:Play(); Debris:AddItem(s,2) end
+		end
+	end
+
+	for nft,_ in pairs(token.nftFx) do
+		HackFX.DetachNft(nft, token)
+	end
+
+	local fx = token.coinFx
+
+	if fx.rotConn then fx.rotConn:Disconnect() end
+	if fx.loopSnd and fx.loopSnd.Parent then
+		fx.loopSnd:Stop()
+		fx.loopSnd:Destroy()
+	end
+
+	if fx.folder and fx.folder.Parent then
+		fx.folder:Destroy()
+	end
+
+	token.coinFx = nil
+end
+
+return HackFX
