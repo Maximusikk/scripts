@@ -1,0 +1,61 @@
+-- StarterPlayerScripts/LocalHintTextClient.client.lua
+-- Локальный показ seed/crit/hint текста по событию LocalHintText.
+
+local ReplicatedStorage = game:GetService("ReplicatedStorage")
+local TweenService = game:GetService("TweenService")
+local Workspace = game:GetService("Workspace")
+
+local LocalHintTextRE = ReplicatedStorage:WaitForChild("LocalHintText")
+
+local function spawnLocalHint(position: Vector3, text: string, color: Color3?, yOffset: number?)
+	if typeof(position) ~= "Vector3" then return end
+	if type(text) ~= "string" then return end
+
+	local offset = yOffset or 0
+	local anchor = Instance.new("Part")
+	anchor.Anchored = true
+	anchor.CanCollide = false
+	anchor.CanQuery = false
+	anchor.CanTouch = false
+	anchor.Transparency = 1
+	anchor.Size = Vector3.new(1, 1, 1)
+	anchor.CFrame = CFrame.new(position + Vector3.new(0, 3 + offset, 0))
+	anchor.Parent = Workspace
+
+	local bb = Instance.new("BillboardGui")
+	bb.Size = UDim2.new(0, 200, 0, 60)
+	bb.AlwaysOnTop = true
+	bb.LightInfluence = 0
+	bb.Adornee = anchor
+	bb.Parent = anchor
+
+	local lbl = Instance.new("TextLabel")
+	lbl.Size = UDim2.new(1, 0, 1, 0)
+	lbl.BackgroundTransparency = 1
+	lbl.Text = text
+	lbl.TextColor3 = color or Color3.new(1, 1, 1)
+	lbl.TextScaled = true
+	lbl.TextWrapped = true
+	lbl.Font = Enum.Font.SciFi
+	lbl.Parent = bb
+	lbl.TextTransparency = 0
+	lbl.TextStrokeTransparency = 0.15
+	lbl.Rotation = (math.random() - 0.5) * 8
+
+	local uiStroke = Instance.new("UIStroke")
+	uiStroke.Thickness = 2
+	uiStroke.Color = Color3.new(0, 0, 0)
+	uiStroke.Parent = lbl
+
+	TweenService:Create(anchor, TweenInfo.new(1.0, Enum.EasingStyle.Quad, Enum.EasingDirection.Out), {
+		CFrame = anchor.CFrame * CFrame.new(0, 4.5, 0),
+	}):Play()
+
+	task.delay(1.6, function()
+		if anchor and anchor.Parent then
+			anchor:Destroy()
+		end
+	end)
+end
+
+LocalHintTextRE.OnClientEvent:Connect(spawnLocalHint)
