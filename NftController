@@ -8,11 +8,35 @@ local hasActiveBoost -- forward declare (чтобы было видно в loop)
 -- Background → coin multiplier
 --========================================================
 local Backgrounds = {
-	AmberGlow= {multiple=1}, LightGray= {multiple=1}, BeigePastel= {multiple=1},
-	BlueMist=  {multiple=1}, GrassCalm= {multiple=1}, PinkSoft=   {multiple=1.5},
-	TauWarm=   {multiple=1.5},  CobaltHaze={multiple=1.5},  OliveRich=  {multiple=1.5},
-	PeachSunset={multiple=1.5}, CrimsonShockWave={multiple=2}, EmeraldCrystal={multiple=2},
-	GoldBullion={multiple=3}, RubyGemstone={multiple=3}, RoyalCrown={multiple=5},
+	-- Обычные
+	LightGray    = {multiple = 1.00},
+	GrassCalm    = {multiple = 1.00},
+	OliveRich    = {multiple = 1.00},
+	TauWarm      = {multiple = 1.00},
+	BeigePastel  = {multiple = 1.00},
+
+	-- Средние (приятный бонус, но не жир)
+	AmberGlow    = {multiple = 1.12},
+	CobaltHaze   = {multiple = 1.14},
+	PeachSunset  = {multiple = 1.16},
+	PinkSoft     = {multiple = 1.18},
+	BlueMist     = {multiple = 1.20},
+
+	-- Дорогие (шире диапазон, но потолок 1.75)
+	CrimsonShockWave = {multiple = 1.35},
+	EmeraldCrystal   = {multiple = 1.45},
+	RubyGemstone     = {multiple = 1.55},
+	GoldBullion      = {multiple = 1.65},
+
+	-- Топ (только он реально сильный)
+	RoyalCrown       = {multiple = 1.85},
+}
+
+local PerHpByWorld = {
+	PixelForest  = {0.74, 0.80},
+	DarkMagic    = {0.67, 0.73},
+	SumeruForest = {0.58, 0.64},
+	PalmParadise = {0.50, 0.56},
 }
 
 local ReplicatedStorage = game:GetService("ReplicatedStorage")
