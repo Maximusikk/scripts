@@ -4119,12 +4119,7 @@ end)
 --========================================================
 -- [ATOMIC] Equip Best: применяем и сохраняем ИМЕННО желаемый список
 --========================================================
-local function applyEquippedLayoutServer(player: Player, desiredList: {string})
-	EquippedNFTs[player] = EquippedNFTs[player] or {}
-	local PlayerInventory = ServerStorage:FindFirstChild(player.UserId .. "_Data")
-	local nftsFolder = PlayerInventory and PlayerInventory:FindFirstChild("NFT")
-	if not nftsFolder then return {ok=false, err="inventory_missing"} end
-
+local function buildCleanDesiredList(nftsFolder: Instance, desiredList: {string})
 	local seen, clean = {}, {}
 	for _, id in ipairs(desiredList or {}) do
 		local uuid = tostring(id)
@@ -4133,10 +4128,14 @@ local function applyEquippedLayoutServer(player: Player, desiredList: {string})
 			table.insert(clean, uuid)
 		end
 	end
+	return clean
+end
 
-	local maxSlotsNow = getMaxEquipped(player)
+local function applyEquippedList(player: Player, clean: {string}, maxSlotsNow: number)
 	local targetSetNow = {}
-	for i, uuid in ipairs(clean) do if i <= maxSlotsNow then targetSetNow[uuid] = true end end
+	for i, uuid in ipairs(clean) do
+		if i <= maxSlotsNow then targetSetNow[uuid] = true end
+	end
 
 	for i = #EquippedNFTs[player], 1, -1 do
 		local m = EquippedNFTs[player][i]
@@ -4158,9 +4157,10 @@ local function applyEquippedLayoutServer(player: Player, desiredList: {string})
 	else
 		PendingEquip[player] = nil
 	end
+end
 
+local function saveEquippedLayout(player: Player, payload: {string})
 	local key = tostring(player.UserId)
-	local payload = clean
 	local ok, err = pcall(function() EquippedStore:SetAsync(key, payload) end)
 	if not ok then
 		warn("[EquippedStore] hard save failed:", err)
@@ -4173,6 +4173,18 @@ local function applyEquippedLayoutServer(player: Player, desiredList: {string})
 	_saveDueAt[player] = tick() + MIN_SAVE_INTERVAL
 
 	return {ok=true, equipped=payload}
+end
+
+local function applyEquippedLayoutServer(player: Player, desiredList: {string})
+	EquippedNFTs[player] = EquippedNFTs[player] or {}
+	local PlayerInventory = ServerStorage:FindFirstChild(player.UserId .. "_Data")
+	local nftsFolder = PlayerInventory and PlayerInventory:FindFirstChild("NFT")
+	if not nftsFolder then return {ok=false, err="inventory_missing"} end
+
+	local clean = buildCleanDesiredList(nftsFolder, desiredList)
+	local maxSlotsNow = getMaxEquipped(player)
+	applyEquippedList(player, clean, maxSlotsNow)
+	return saveEquippedLayout(player, clean)
 end
 
 ApplyEquippedLayoutRF.OnServerInvoke = function(player, desiredList)
