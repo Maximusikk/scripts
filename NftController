@@ -4136,7 +4136,12 @@ end)
 --========================================================
 -- [ATOMIC] Equip Best: применяем и сохраняем ИМЕННО желаемый список
 --========================================================
-local function buildCleanDesiredList(nftsFolder, desiredList)
+local function applyEquippedLayoutServer(player: Player, desiredList: {string})
+	EquippedNFTs[player] = EquippedNFTs[player] or {}
+	local PlayerInventory = ServerStorage:FindFirstChild(player.UserId .. "_Data")
+	local nftsFolder = PlayerInventory and PlayerInventory:FindFirstChild("NFT")
+	if not nftsFolder then return {ok=false, err="inventory_missing"} end
+
 	local seen, clean = {}, {}
 	for _, id in ipairs(desiredList or {}) do
 		local uuid = tostring(id)
@@ -4145,10 +4150,8 @@ local function buildCleanDesiredList(nftsFolder, desiredList)
 			table.insert(clean, uuid)
 		end
 	end
-	return clean
-end
 
-local function applyTargetEquipSet(player, clean, maxSlotsNow)
+	local maxSlotsNow = getMaxEquipped(player)
 	local targetSetNow = {}
 	for i, uuid in ipairs(clean) do
 		if i > maxSlotsNow then break end
@@ -4167,9 +4170,7 @@ local function applyTargetEquipSet(player, clean, maxSlotsNow)
 		local _, exists = findEquippedModelByUuid(player, uuid)
 		if not exists then spawnEquippedModel(player, uuid) end
 	end
-end
 
-local function updatePendingEquipList(player, clean, maxSlotsNow)
 	if #clean > maxSlotsNow then
 		PendingEquip[player] = {}
 		for i = maxSlotsNow + 1, #clean do
@@ -4178,19 +4179,6 @@ local function updatePendingEquipList(player, clean, maxSlotsNow)
 	else
 		PendingEquip[player] = nil
 	end
-end
-
-local function applyEquippedLayoutServer(player: Player, desiredList: {string})
-	EquippedNFTs[player] = EquippedNFTs[player] or {}
-	local PlayerInventory = ServerStorage:FindFirstChild(player.UserId .. "_Data")
-	local nftsFolder = PlayerInventory and PlayerInventory:FindFirstChild("NFT")
-	if not nftsFolder then return {ok=false, err="inventory_missing"} end
-
-	local clean = buildCleanDesiredList(nftsFolder, desiredList)
-
-	local maxSlotsNow = getMaxEquipped(player)
-	applyTargetEquipSet(player, clean, maxSlotsNow)
-	updatePendingEquipList(player, clean, maxSlotsNow)
 
 	local key = tostring(player.UserId)
 	local payload = clean
